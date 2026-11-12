@@ -1,0 +1,16 @@
+# Blackboard mitigation side
+fastapi
+uvicorn
+chromadb
+openai
+google-genai
+requests
+
+# Probe / detection side
+torch
+transformers
+scikit-learn
+joblib
+numpy
+datasets
+accelerate
