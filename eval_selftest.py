@@ -384,6 +384,53 @@ print('RESULT', json.dumps({'cfg': b.ROLE_CONFIG, 'seen': seen, 'n_clients': len
     print("ok  per-role models (mixed LLMs), defaults unchanged")
 
 
+def test_multi_server_routing():
+    """LLM_BASE_URL / LLM_<ROLE>_BASE_URL may list several servers (one per GPU): concurrent calls are
+    spread over them, and a failing server is skipped on retry."""
+    import subprocess, tempfile, json as _j
+    code = r"""
+import sys, json, time, threading; sys.path.insert(0, 'blackboard')
+import blackboard_core as b
+b.time.sleep = lambda s: None
+seen = []
+class M: content = 'ok'
+class C: message = M()
+class R: choices = [C()]
+def spy(tag, fail=False):
+    def create(**k):
+        seen.append(tag)
+        if fail: raise RuntimeError('server down')
+        threading.Event().wait(0.05)   # a call that takes a while, so calls overlap
+        return R()
+    return create
+urls = [str(c.base_url).rstrip('/') for c in b._groq_clients]
+for i, c in enumerate(b._groq_clients):
+    c.chat.completions.create = spy(f'gpu{i}')
+ts = [threading.Thread(target=b.verifier_agent.llm_caller, args=('p',)) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+spread = {t: seen.count(t) for t in set(seen)}
+seen.clear()
+b._groq_clients[0].chat.completions.create = spy('gpu0', fail=True)
+out = [b.verifier_agent.llm_caller('p') for _ in range(3)]
+role_urls = [str(c.base_url).rstrip('/') for c in [b._ROLE_CLIENTS.get('JUDGE')] if c]
+print('RESULT', json.dumps({'urls': urls, 'spread': spread, 'failover': seen, 'out': out,
+      'n_clients': len(b.all_clients())}))
+"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LLM_")}
+    env.update({"CHROMA_PERSIST_DIRECTORY": tempfile.mkdtemp(), "GROQ_MODEL": "llama",
+                "LLM_BASE_URL": "http://localhost:11434/v1,http://localhost:11435/v1"})
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120)
+    line = [l for l in out.stdout.splitlines() if l.startswith("RESULT")]
+    assert line, out.stderr[-800:]
+    r = _j.loads(line[0][7:])
+    assert r["urls"] == ["http://localhost:11434/v1", "http://localhost:11435/v1"] and r["n_clients"] == 2
+    assert r["spread"].get("gpu0", 0) >= 2 and r["spread"].get("gpu1", 0) >= 2, r["spread"]   # both servers used
+    # gpu0 fails once, is then avoided for 30 s: every call still succeeds, at most one wasted attempt
+    assert r["out"] == ["ok"] * 3 and r["failover"].count("gpu0") <= 1, r["failover"]
+    assert r["failover"].count("gpu1") == 3, r["failover"]
+    print("ok  multi-server routing (one server per GPU: least-busy spread + failover)")
+
+
 def test_provider_override():
     import subprocess, tempfile
     code = ("import sys; sys.path.insert(0, 'blackboard'); import blackboard_core as b; "
@@ -735,6 +782,7 @@ if __name__ == "__main__":
     test_abstention_routing_guards()
     test_length_cap()
     test_per_role_models()
+    test_multi_server_routing()
     test_provider_override()
     test_preflight()
     test_partial_checkpoint_and_max_items()

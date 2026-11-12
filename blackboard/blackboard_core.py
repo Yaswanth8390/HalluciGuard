@@ -1334,18 +1334,61 @@ _LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "0") or 0) or None
 # json_object; supported by vLLM, Groq, OpenRouter, Ollama). Recommended for small open models, which
 # otherwise often wrap or break the JSON. Off by default to keep the original behaviour.
 LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "0").strip().lower() in ("1", "true", "yes")
-_groq_client = OpenAI(base_url=LLM_BASE_URL, api_key=GROQ_API_KEY, **({"timeout": _LLM_TIMEOUT} if _LLM_TIMEOUT else {}))
+_CLIENT_KW = {"timeout": _LLM_TIMEOUT} if _LLM_TIMEOUT else {}
 
 
-def _make_caller(client, model, label):
+def _split_urls(value):
+    """A base URL setting may list several servers hosting the same models, comma separated (e.g. one
+    Ollama/vLLM server per GPU). Calls are then spread over them (least busy first)."""
+    return [u.strip() for u in str(value).split(",") if u.strip()]
+
+
+LLM_BASE_URLS = _split_urls(LLM_BASE_URL)
+_groq_clients = [OpenAI(base_url=u, api_key=GROQ_API_KEY, **_CLIENT_KW) for u in LLM_BASE_URLS]
+_groq_client = _groq_clients[0]
+
+import threading as _threading
+_INFLIGHT = {}                    # id(client) -> requests currently running on it
+_INFLIGHT_LOCK = _threading.Lock()
+
+
+_RR = [0]                         # round-robin tie-break, so idle servers take turns
+_BAD_UNTIL = {}                   # id(client) -> time until which a failing server is avoided
+_BAD_SECONDS = 30.0
+
+
+def _pick_client(clients, attempt, tried):
+    """Least-busy healthy client; on a retry prefer one not tried yet (fail over to the other server)."""
+    with _INFLIGHT_LOCK:
+        now = time.time()
+        pool = [c for c in clients if id(c) not in tried] or clients
+        pool = [c for c in pool if _BAD_UNTIL.get(id(c), 0) <= now] or pool
+        _RR[0] += 1
+        rr = _RR[0]
+        c = min(pool, key=lambda x: (_INFLIGHT.get(id(x), 0), (clients.index(x) - rr) % len(clients)))
+        _INFLIGHT[id(c)] = _INFLIGHT.get(id(c), 0) + 1
+        return c
+
+
+def _release_client(c):
+    with _INFLIGHT_LOCK:
+        _INFLIGHT[id(c)] = max(0, _INFLIGHT.get(id(c), 1) - 1)
+
+
+def _make_caller(clients, model, label):
+    """clients: a list of OpenAI clients serving `model` (None = the default client(s), looked up at call
+    time so tests / callers can swap `_groq_client`)."""
     def caller(prompt, *, temperature=0.0, response_mime_type=None, max_tokens=None, **kw):
         last = None
         limit = max_tokens or LLM_MAX_TOKENS
         extra = {"max_tokens": limit} if limit else {}
         if LLM_JSON_MODE and response_mime_type == "application/json":
             extra["response_format"] = {"type": "json_object"}
-        cl = client if client is not None else _groq_client   # default client is looked up at call time
+        pool = clients if clients is not None else [_groq_client] + _groq_clients[1:]
+        tried = set()
         for attempt in range(3):
+            cl = _pick_client(pool, attempt, tried) if len(pool) > 1 else pool[0]
+            tried.add(id(cl))
             try:
                 r = cl.chat.completions.create(
                     model=model,
@@ -1355,11 +1398,21 @@ def _make_caller(client, model, label):
                 )
                 text = (r.choices[0].message.content or "").strip()
                 if text:
+                    if len(pool) > 1:
+                        _BAD_UNTIL.pop(id(cl), None)
                     return text
                 raise ValueError("empty response")
             except Exception as e:
                 last = e
+                if len(pool) > 1:
+                    if not isinstance(e, ValueError):   # server/connection error, not just an empty answer
+                        _BAD_UNTIL[id(cl)] = time.time() + _BAD_SECONDS
+                    if len(tried) < len(pool):
+                        continue                        # an untried server is available: retry there at once
                 time.sleep(2 * (attempt + 1))
+            finally:
+                if len(pool) > 1:
+                    _release_client(cl)
         raise RuntimeError(f"{label} ({model}) failed after 3 attempts: {last}")
     return caller
 
@@ -1382,10 +1435,25 @@ ROLE_CALLERS = {}       # role -> caller
 
 def all_clients():
     """Every distinct client in use (for token accounting in --preflight)."""
-    out = [_groq_client]
+    out = [_groq_client] + [c for c in _groq_clients[1:]]
     for c in _EXTRA_CLIENTS.values():
         if c not in out:
             out.append(c)
+    return out
+
+
+def _clients_for(base, key):
+    """One client per URL in `base` (comma-separated), reusing the default clients where they match."""
+    out = []
+    for url in _split_urls(base):
+        if key == GROQ_API_KEY and url in LLM_BASE_URLS:
+            out.append(_groq_clients[LLM_BASE_URLS.index(url)])
+            continue
+        c = _EXTRA_CLIENTS.get((url, key))
+        if c is None:
+            c = OpenAI(base_url=url, api_key=key, **_CLIENT_KW)
+            _EXTRA_CLIENTS[(url, key)] = c
+        out.append(c)
     return out
 
 
@@ -1397,22 +1465,17 @@ def _role_caller(role):
         ROLE_CALLERS[role] = groq_caller
         return groq_caller
     base, key, model = base or LLM_BASE_URL, key or GROQ_API_KEY, model or GROQ_MODEL
-    if (base, key) == (LLM_BASE_URL, GROQ_API_KEY):
-        client = _groq_client
-    else:
-        client = _EXTRA_CLIENTS.get((base, key))
-        if client is None:
-            client = OpenAI(base_url=base, api_key=key, **({"timeout": _LLM_TIMEOUT} if _LLM_TIMEOUT else {}))
-            _EXTRA_CLIENTS[(base, key)] = client
-    _ROLE_CLIENTS[role] = client
-    caller = _make_caller(client, model, f"{role.lower()} LLM")
+    clients = _clients_for(base, key)
+    _ROLE_CLIENTS[role] = clients[0]
+    caller = _make_caller(clients, model, f"{role.lower()} LLM")
 
     ROLE_CONFIG[role] = {"base_url": base, "model": model}
     ROLE_CALLERS[role] = caller
     return caller
 
 
-print("LLM caller ready:", GROQ_MODEL, "@", LLM_BASE_URL)
+print("LLM caller ready:", GROQ_MODEL, "@", LLM_BASE_URL,
+      f"({len(LLM_BASE_URLS)} servers, least-busy routing)" if len(LLM_BASE_URLS) > 1 else "")
 
 
 # ---------------------------------------------------------------------------

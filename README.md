@@ -40,7 +40,11 @@ unchanged, kept as a baseline.
   FActScore with gamma=10, % responding, facts per response, and LLM calls. Scoring is done by
   `factscore_eval.py` with a separate judge model.
 - **Open models, no API quota:** the agents are Llama-3.1-8B / Mistral-7B (judge: Gemma-2-9B) served
-  by Ollama on a Kaggle T4x2 box. Each role is set with `LLM_<ROLE>_MODEL`; `LLM_JSON_MODE=1` makes the
+  by Ollama on a Kaggle T4x2 box. `scripts/kaggle_serve_agents.sh` starts **one server per GPU** with
+  both agent models on each. Any base URL setting can list several servers
+  (`LLM_BASE_URL="http://localhost:11434/v1,http://localhost:11435/v1"`); each call then goes to the
+  least-busy server, and a failing server is skipped for 30 s. The judge runs in its own phase
+  (`kaggle_serve_agents.sh judge`). Each role is set with `LLM_<ROLE>_MODEL`; `LLM_JSON_MODE=1` makes the
   server return JSON objects.
 
 **Run it on Kaggle:** open `notebooks/kaggle_eval.ipynb` (GPU T4 x2, internet on) and run the cells top
