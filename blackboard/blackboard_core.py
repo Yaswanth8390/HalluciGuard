@@ -18,23 +18,24 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 import requests
-from google import genai
-from google.genai import types
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Legacy Gemini path (from the original notebook). Every agent is wired to the OpenAI-compatible
+# callers further down; Gemini is only used if a caller is explicitly swapped back to it.
 GEMINI_API_KEY = os.environ.get("HALLUCIGUARD_KEY")
-
-if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    gemini_client = None
-    print("HALLUCIGUARD_KEY not set; Gemini disabled, using Groq instead.")
-
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-print(f"Gemini configured with model: {GEMINI_MODEL}")
+gemini_client = None
+types = None
+if GEMINI_API_KEY:
+    try:
+        from google import genai
+        from google.genai import types
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except ImportError:
+        print("HALLUCIGUARD_KEY set but google-genai is not installed; Gemini disabled.")
 
 # External SAE scores at or above this value enter the Blackboard pipeline.
 HALLUCINATION_RISK_THRESHOLD = 0.70
@@ -194,6 +195,9 @@ def call_gemini_with_retry(
         config_args["response_mime_type"] = response_mime_type
 
     last_error = None
+
+    if gemini_client is None:
+        raise RuntimeError("Gemini is not configured (set HALLUCIGUARD_KEY and install google-genai).")
 
     for attempt in range(1, max_retries + 1):
         elapsed = time.time() - _last_gemini_call_time
@@ -1305,8 +1309,12 @@ from openai import OpenAI
 
 # Any OpenAI-compatible provider works: set LLM_BASE_URL, LLM_API_KEY (and GROQ_MODEL for the model id).
 # Defaults keep the original behaviour (Groq, GROQ_API_KEY).
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+_GROQ_URL = "https://api.groq.com/openai/v1"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", _GROQ_URL)
 GROQ_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY and LLM_BASE_URL.rstrip("/") != _GROQ_URL:
+    # self-hosted OpenAI-compatible server (vLLM / Ollama / llama.cpp) usually needs no key
+    GROQ_API_KEY = "EMPTY"
 if not GROQ_API_KEY:
     # CHANGED: the notebook used getpass() here, which blocks waiting for
     # keyboard input. That's fine in a notebook cell but would hang a
@@ -1322,34 +1330,48 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 #   LLM_MAX_TOKENS  cap on generated tokens per call      LLM_TIMEOUT  per-request timeout in seconds
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "0") or 0) or None
 _LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "0") or 0) or None
+# LLM_JSON_MODE=1 asks the server for a JSON object whenever an agent wants JSON (response_format
+# json_object; supported by vLLM, Groq, OpenRouter, Ollama). Recommended for small open models, which
+# otherwise often wrap or break the JSON. Off by default to keep the original behaviour.
+LLM_JSON_MODE = os.getenv("LLM_JSON_MODE", "0").strip().lower() in ("1", "true", "yes")
 _groq_client = OpenAI(base_url=LLM_BASE_URL, api_key=GROQ_API_KEY, **({"timeout": _LLM_TIMEOUT} if _LLM_TIMEOUT else {}))
 
 
-def groq_caller(prompt, *, temperature=0.0, response_mime_type=None, max_tokens=None, **kw):
-    last = None
-    limit = max_tokens or LLM_MAX_TOKENS
-    for attempt in range(3):
-        try:
-            r = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-                **({"max_tokens": limit} if limit else {}),
-            )
-            text = (r.choices[0].message.content or "").strip()
-            if text:
-                return text
-            raise ValueError("empty response")
-        except Exception as e:
-            last = e
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Groq failed after 3 attempts: {last}")
+def _make_caller(client, model, label):
+    def caller(prompt, *, temperature=0.0, response_mime_type=None, max_tokens=None, **kw):
+        last = None
+        limit = max_tokens or LLM_MAX_TOKENS
+        extra = {"max_tokens": limit} if limit else {}
+        if LLM_JSON_MODE and response_mime_type == "application/json":
+            extra["response_format"] = {"type": "json_object"}
+        cl = client if client is not None else _groq_client   # default client is looked up at call time
+        for attempt in range(3):
+            try:
+                r = cl.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                    **extra,
+                )
+                text = (r.choices[0].message.content or "").strip()
+                if text:
+                    return text
+                raise ValueError("empty response")
+            except Exception as e:
+                last = e
+                time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"{label} ({model}) failed after 3 attempts: {last}")
+    return caller
+
+
+groq_caller = _make_caller(None, GROQ_MODEL, "LLM")
 
 
 # ---------------------------------------------------------------------------
 # Per-role models (heterogeneous agents). Each role can use its own model / endpoint / key:
 #   LLM_<ROLE>_MODEL, LLM_<ROLE>_BASE_URL, LLM_<ROLE>_API_KEY      ROLE in EXTRACTOR, VERIFIER,
-#   CORRECTOR, ABSTENTION, ANSWER. Anything not set falls back to the default model above,
+#   CORRECTOR, ABSTENTION, ANSWER, and the blackboard's DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT,
+#   COMPOSER (+ JUDGE for factscore_eval.py). Anything not set falls back to the default model above,
 #   so with no LLM_<ROLE>_* variables every role uses the default and behaviour is unchanged.
 # ---------------------------------------------------------------------------
 _EXTRA_CLIENTS = {}     # (base_url, api_key) -> client, shared by roles that use the same endpoint
@@ -1383,26 +1405,7 @@ def _role_caller(role):
             client = OpenAI(base_url=base, api_key=key, **({"timeout": _LLM_TIMEOUT} if _LLM_TIMEOUT else {}))
             _EXTRA_CLIENTS[(base, key)] = client
     _ROLE_CLIENTS[role] = client
-
-    def caller(prompt, *, temperature=0.0, response_mime_type=None, max_tokens=None, **kw):
-        last = None
-        limit = max_tokens or LLM_MAX_TOKENS
-        for attempt in range(3):
-            try:
-                r = client.chat.completions.create(
-                    model=model,
-                    temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}],
-                    **({"max_tokens": limit} if limit else {}),
-                )
-                text = (r.choices[0].message.content or "").strip()
-                if text:
-                    return text
-                raise ValueError("empty response")
-            except Exception as e:
-                last = e
-                time.sleep(2 * (attempt + 1))
-        raise RuntimeError(f"{role.lower()} LLM ({model}) failed after 3 attempts: {last}")
+    caller = _make_caller(client, model, f"{role.lower()} LLM")
 
     ROLE_CONFIG[role] = {"base_url": base, "model": model}
     ROLE_CALLERS[role] = caller
@@ -1453,7 +1456,46 @@ orchestrator = Orchestrator(
     answer_agent=answer_agent,
 )
 
-print("HalluciGuard components initialized.")
+# ---------------------------------------------------------------------------
+# Blackboard controller (the real blackboard architecture: control.py + knowledge_sources.py)
+# ---------------------------------------------------------------------------
+# The fixed Orchestrator above stays as the "pipeline" baseline. process_response() picks one with
+# its `controller` argument, default HALLUCIGUARD_CONTROLLER (blackboard | pipeline | cove | crag).
+
+import sys as _sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+import control as bb_control      # noqa: E402
+import baselines as bb_baselines  # noqa: E402
+
+CONTROLLERS = ("blackboard", "pipeline", "cove", "crag")
+DEFAULT_CONTROLLER = os.getenv("HALLUCIGUARD_CONTROLLER", "blackboard").strip().lower()
+if DEFAULT_CONTROLLER not in CONTROLLERS:
+    raise RuntimeError(f"HALLUCIGUARD_CONTROLLER must be one of {CONTROLLERS}, got {DEFAULT_CONTROLLER!r}")
+
+BLACKBOARD_ROLE_CALLERS = {r: _role_caller(r) for r in ("DECOMPOSER", "REFORMULATOR", "HYPOTHESIS", "CONFLICT", "COMPOSER")}
+BASELINE_CALLER = _role_caller("BASELINE")   # CoVe / CRAG use one model, like in their papers
+
+
+def build_blackboard_controller(*, memory_agent=memory_agent, web_search_agent=web_search_agent,
+                                max_llm_calls=None, disabled=(), **kw):
+    """A fresh controller (use one per experiment setting). Pass memory_agent=None to run without
+    episodic memory, web_search_agent=None to stay offline, disabled=[KS names] for ablations."""
+    if web_search_agent is not None and not getattr(web_search_agent, "enabled", False):
+        web_search_agent = None
+    return bb_control.build_controller(
+        retrieval_agent=retrieval_agent, verifier_agent=verifier_agent, answer_agent=answer_agent,
+        correction_agent=correction_agent, memory_agent=memory_agent, web_search_agent=web_search_agent,
+        callers=BLACKBOARD_ROLE_CALLERS, max_llm_calls=max_llm_calls, disabled=disabled,
+        retrieval_top_k=RETRIEVAL_TOP_K, **kw)
+
+
+blackboard_controller = build_blackboard_controller()
+# set to False to stop the blackboard writing verdicts into episodic memory (e.g. isolated evals)
+BLACKBOARD_WRITE_MEMORY = True
+
+print("HalluciGuard components initialized. Default controller:", DEFAULT_CONTROLLER)
 
 
 # ---------------------------------------------------------------------------
@@ -1511,17 +1553,75 @@ def reset_knowledge_collection() -> None:
     print("Knowledge base cleared.")
 
 
-def process_response(prompt: str, response: str, confidence_score: float) -> Dict[str, Any]:
+def _run_controller(controller: str, prompt: str, response: str, confidence_score: float,
+                    abstention_check: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the blackboard controller or a baseline; return a result in process_response's format."""
+    # the phrase list matches substrings ("uncertain", "not available"), which also occur inside long,
+    # substantive answers such as biographies; only a short response counts as an abstention here
+    is_abst = bool(abstention_check["is_abstention"]) and len(response.split()) <= 40
+    short = len(response.split()) <= blackboard_controller.short_max_words
+    if controller == "blackboard":
+        ctl = blackboard_controller
+        out = ctl.run(prompt, response, confidence_score, abstention=is_abst)
+        ws = out.pop("workspace")
+        if BLACKBOARD_WRITE_MEMORY and "Memory" in [k.name for k in ctl.ks]:
+            out["memory_records_written"] = ctl.log_to_memory(ws, ctl.get_ks("Memory").memory_agent,
+                                                              out["final_response"])
+    elif controller == "cove":
+        out = bb_baselines.run_cove(prompt, response, BASELINE_CALLER, short=short,
+                                    max_llm_calls=blackboard_controller.max_llm_calls)
+        out["status"] = "BLACKBOARD_PROCESSED"
+    elif controller == "crag":
+        web = blackboard_controller.get_ks("WebSearch")
+        out = bb_baselines.run_crag(prompt, response, BASELINE_CALLER, retrieval_agent,
+                                    web_search_agent=web.web_agent if web else None, short=short,
+                                    top_k=RETRIEVAL_TOP_K, max_llm_calls=blackboard_controller.max_llm_calls)
+        out["status"] = "BLACKBOARD_PROCESSED"
+    else:
+        raise ValueError(f"unknown controller {controller!r}")
+    if is_abst and controller != "blackboard":
+        changed = out["final_response"].strip() != response.strip()
+        out["status"] = "ABSTENTION_RESOLVED" if changed else "ABSTENTION"
+    return {
+        "status": out["status"],
+        "controller": controller,
+        "pipeline_triggered": True,
+        "confidence_score": confidence_score,
+        "threshold": HALLUCINATION_RISK_THRESHOLD,
+        "prompt": prompt,
+        "original_response": response,
+        "final_response": out["final_response"],
+        "extracted_claim": out.get("extracted_claim"),
+        "flagged_span": out.get("flagged_span"),
+        "extraction_reason": None,
+        "verification_result": out.get("verification_result"),
+        "correction_result": out.get("correction_result"),
+        "orchestrator_result": None,
+        "abstention_detection": abstention_check,
+        "evidence_source": out.get("evidence_source"),
+        "budget": out.get("budget"),
+        "blackboard_trace": out.get("blackboard_trace"),
+        "memory_records_written": out.get("memory_records_written", 0),
+    }
+
+
+def process_response(prompt: str, response: str, confidence_score: float,
+                     controller: Optional[str] = None) -> Dict[str, Any]:
     """
     Top-level HalluciGuard interface — this is the integration point.
 
-    - abstention ("Unknown", "I don't know"): ALWAYS routed to the Blackboard
+    - abstention ("Unknown", "I don't know"): ALWAYS routed to mitigation
       to be answered from evidence, regardless of score.
     - otherwise, score below HALLUCINATION_RISK_THRESHOLD: response returned
       unchanged, no pipeline work occurs.
-    - otherwise, score at or above threshold: extract the risky claim and run
-      the full Blackboard pipeline.
+    - otherwise, score at or above threshold: mitigation runs.
+
+    controller: "blackboard" (default; control.py drives the knowledge sources over a shared
+    workspace), "pipeline" (the original fixed Orchestrator), or the baselines "cove" / "crag".
     """
+    controller = (controller or DEFAULT_CONTROLLER).strip().lower()
+    if controller not in CONTROLLERS:
+        raise ValueError(f"controller must be one of {CONTROLLERS}, got {controller!r}")
     if not isinstance(prompt, str):
         raise TypeError("prompt must be a string.")
     if not isinstance(response, str):
@@ -1542,6 +1642,8 @@ def process_response(prompt: str, response: str, confidence_score: float) -> Dic
     # fallback costs a model call, so it only runs on responses the probe
     # already flagged as risky.
     abstention_check = abstention_detector.is_abstention(response, allow_llm=above_threshold)
+    if controller != "pipeline" and (abstention_check["is_abstention"] or above_threshold):
+        return _run_controller(controller, prompt, response, confidence_score, abstention_check)
     if abstention_check["is_abstention"]:
         resolution = orchestrator.resolve_abstention(
             prompt=prompt, response=response, confidence_score=confidence_score,

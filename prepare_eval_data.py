@@ -12,6 +12,10 @@ Output rows: {"question", "answers": [aliases...], "group", "s_pop"?, "prop"?}
             FULL PopQA test set, then sampled equally from each tercile (seeded).
   TriviaQA: group = "triviaqa" (validation split of unfiltered.nocontext; train is not used).
 
+With --wiki (PopQA only) the subject's Wikipedia article is fetched and split into passages:
+  * `knowledge` = the passage that contains a gold answer (used by eval_pipeline --kb_coverage F)
+  * all passages of all items -> <out>_kb.jsonl (used by eval_pipeline --kb_file: realistic retrieval)
+
 Sources: HuggingFace `akariasai/PopQA` (split test) and `mandarjoshi/trivia_qa`
 (config unfiltered.nocontext, split validation). Use --popqa_file / --triviaqa_file to read a
 local json/jsonl/csv export instead (offline machines).
@@ -86,7 +90,8 @@ def build_popqa(rows, n, seed):
         if not q or not ans:
             continue
         items.append({"question": q, "answers": ans, "s_pop": float(r["s_pop"]),
-                      "prop": r.get("prop", ""), "popqa_id": r.get("id", "")})
+                      "prop": r.get("prop", ""), "popqa_id": r.get("id", ""),
+                      "subj": r.get("subj", ""), "s_wiki_title": r.get("s_wiki_title", "") or r.get("subj", "")})
     # tercile cut points over the full set (not the sample)
     pops = sorted(x["s_pop"] for x in items)
     lo, hi = pops[len(pops) // 3], pops[2 * len(pops) // 3]
@@ -121,6 +126,31 @@ def build_triviaqa(rows, n, seed):
     return items[:n]
 
 
+def add_wikipedia(items, args):
+    """Attach Wikipedia knowledge to PopQA items and write the shared KB passages file."""
+    from kb_utils import chunk_article, fetch_wikipedia, gold_passage
+    Path(args.wiki_cache).parent.mkdir(parents=True, exist_ok=True)
+    titles = [x["s_wiki_title"] for x in items if x.get("s_wiki_title")]
+    print(f"fetching {len(set(titles))} Wikipedia articles (cached in {args.wiki_cache})...")
+    texts = fetch_wikipedia(titles, cache_path=args.wiki_cache)
+    kb_path = Path(args.kb_out or str(Path(args.out).with_suffix("")) + "_kb.jsonl")
+    seen, n_gold, n_article = set(), 0, 0
+    with open(kb_path, "w", encoding="utf-8") as f:
+        for i, x in enumerate(items):
+            title = x.get("s_wiki_title", "")
+            passages = chunk_article(title, texts.get(title, ""), args.passage_words, args.max_passages) if title else []
+            n_article += bool(passages)
+            gp = gold_passage(passages, x["answers"])
+            x["knowledge"] = gp or ""          # empty = the answer is not in the article: never "covered"
+            n_gold += bool(gp)
+            for p in passages:
+                if p not in seen:
+                    seen.add(p)
+                    f.write(json.dumps({"text": p, "title": title}, ensure_ascii=False) + "\n")
+    print(f"wikipedia: {n_article}/{len(items)} items have an article, {n_gold} contain a gold answer; "
+          f"{len(seen)} passages -> {kb_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", required=True, choices=["popqa", "triviaqa"])
@@ -129,10 +159,19 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--popqa_file")
     ap.add_argument("--triviaqa_file")
+    ap.add_argument("--wiki", action="store_true",
+                    help="PopQA: fetch each subject's Wikipedia article. Sets `knowledge` to the passage that contains "
+                         "a gold answer (for --kb_coverage) and writes every passage to --kb_out (for --kb_file)")
+    ap.add_argument("--kb_out", default=None, help="passages file for --wiki (default: <out>_kb.jsonl)")
+    ap.add_argument("--wiki_cache", default="eval_data/wiki_cache.jsonl")
+    ap.add_argument("--passage_words", type=int, default=120)
+    ap.add_argument("--max_passages", type=int, default=20, help="passages kept per article")
     args = ap.parse_args()
 
     if args.dataset == "popqa":
         out = build_popqa(load_popqa(args.popqa_file), args.n, args.seed)
+        if args.wiki:
+            add_wikipedia(out, args)
     else:
         out = build_triviaqa(load_triviaqa(args.triviaqa_file), args.n, args.seed)
 

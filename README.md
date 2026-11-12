@@ -1,4 +1,54 @@
-# Merged Hallucination Detection + Mitigation Pipeline
+# HalluciGuard: probe-based detection + blackboard-architecture mitigation
+
+## What's new: a real blackboard (`feature/real-blackboard`)
+
+The original "Blackboard" was a dict that agents logged to, while a fixed `Orchestrator` ran
+memory -> retrieve -> verify -> correct on **one** extracted claim. Now the shared workspace drives
+control, as in classic blackboard systems:
+
+| piece | file | role |
+|---|---|---|
+| Workspace | `blackboard/workspace.py` | typed entries: question, competing **hypotheses** (candidate answers), atomic **claims**, queries, evidence, verdicts, conflicts; every write is logged |
+| Knowledge sources | `blackboard/knowledge_sources.py` | Decomposer, Memory, Retrieval, QueryReformulator, WebSearch, Verifier, HypothesisGenerator, ConflictResolver, Composer. Each one says what it *could* do given the board and acts only when picked |
+| Control | `blackboard/control.py` | each cycle: recompute claim/hypothesis status from verdicts, post conflicts, stop if solved or out of budget, else run the highest-priority activation (`stage weight x (0.5 + risk) / (1 + LLM cost)`) |
+| Baselines | `blackboard/baselines.py` | CoVe (factored) and CRAG-style corrective RAG on the same models + KB |
+
+What the blackboard does that the old pipeline could not:
+- **Competing hypotheses.** A contradicted answer is not rewritten blindly: the evidence proposes a new
+  candidate answer, which must itself be decomposed and verified before it can win. If nothing can be
+  verified, the system abstains.
+- **Adaptive search.** An INSUFFICIENT claim triggers query reformulation (then web search), instead of
+  just fetching more of the same results.
+- **Conflicts.** Independent verdicts from different sources that disagree become a conflict entry,
+  which a resolver from a different model family settles.
+- **Long answers.** Every claim gets its own entry. Contradicted claims get a revision that is
+  re-verified, and the composer keeps supported facts, swaps in verified revisions and drops unverifiable ones.
+- **Budget + trace.** There is a hard per-question LLM-call budget (`--max_llm_calls`), and a cycle-by-cycle
+  trace of which knowledge source ran and why (`traces.jsonl`).
+
+`process_response(prompt, response, score, controller="blackboard" | "pipeline" | "cove" | "crag")`.
+The default comes from `HALLUCIGUARD_CONTROLLER` (blackboard). `pipeline` is the original Orchestrator,
+unchanged, kept as a baseline.
+
+### Evaluation (paper-comparable)
+- **PopQA** (as in Self-RAG / CRAG): `prepare_eval_data.py --dataset popqa --n 300 --wiki` samples the
+  head/torso/tail popularity terciles and builds a Wikipedia KB (`*_kb.jsonl`). Run
+  `eval_pipeline.py --system <s>` once per system on the same generations, then use
+  `compare_systems.py` for paired bootstrap CIs and McNemar tests. Ablations use `--disable_ks`.
+- **FActScore biographies** (as in CoVe / Self-RAG / CRAG / EVER): `prepare_factscore.py` (500 entities
+  plus their Wikipedia text from HF `dskar/FActScore`), then `eval_bio.py`, which reports FActScore,
+  FActScore with gamma=10, % responding, facts per response, and LLM calls. Scoring is done by
+  `factscore_eval.py` with a separate judge model.
+- **Open models, no API quota:** the agents are Llama-3.1-8B / Mistral-7B (judge: Gemma-2-9B) served
+  by Ollama on a Kaggle T4x2 box. Each role is set with `LLM_<ROLE>_MODEL`; `LLM_JSON_MODE=1` makes the
+  server return JSON objects.
+
+**Run it on Kaggle:** open `notebooks/kaggle_eval.ipynb` (GPU T4 x2, internet on) and run the cells top
+to bottom. Offline tests: `python -m pytest tests -q` and `python eval_selftest.py`.
+
+---
+
+## Original merged pipeline (probe + Blackboard)
 
 This merges two previously separate systems into one pipeline:
 
@@ -13,9 +63,10 @@ This merges two previously separate systems into one pipeline:
    evidence from a knowledge base, verifies the claim, and corrects or
    hedges the response if it's unsupported.
 
-Nothing inside `probe/` or `blackboard/` was changed — the two systems
-already spoke the same language (a `[0, 1]` risk score in, a response out),
-so `pipeline.py` is just the wiring between them.
+The two systems already spoke the same language (a `[0, 1]` risk score in,
+a response out), so `pipeline.py` is just the wiring between them. (The
+diagram below is the original fixed `pipeline` controller; see the section
+above for the blackboard controller that is now the default.)
 
 ## How a request flows end-to-end
 
@@ -31,11 +82,12 @@ scaler.transform() -> classifier.predict_proba()                     [trained pr
    ▼
 blackboard_core.process_response(prompt, response, prob_hallucinated) [blackboard/blackboard_core.py]
    │
+   ├─ AbstentionDetector (always, before the risk gate) – an "I don't know" / "Unknown" answer is
+   │      resolved from evidence when possible: status=ABSTENTION_RESOLVED, otherwise it stands (ABSTENTION)
+   │
    ├─ prob_hallucinated < 0.70  ─────────────────────────► response returned unchanged (status=SKIPPED_LOW_RISK)
    │
    └─ prob_hallucinated ≥ 0.70
-        ├─ AbstentionDetector  – is this already an honest "I don't know"? ─► if yes: status=ABSTENTION,
-        │                                                                      returned unchanged, Blackboard skipped
         └─ if not an abstention:
              ├─ ClaimExtractor   – picks the single riskiest claim
              ├─ MemoryAgent      – checks episodic memory for a past verdict
@@ -97,15 +149,16 @@ retrieval (`--share_memory` to turn that off).
    this step is skipped automatically and behavior falls straight through
    to (1).
 
-3. **An abstention the model already gave shouldn't be relabeled a hallucination.**
+3. **An abstention the model already gave is not treated as a hallucination.**
    The probe's risk score reflects how *unusual* a response's activations
-   look — an honest "I don't know" can score high simply because it's an
-   atypical pattern, not because anything was fabricated. `AbstentionDetector`
-   runs before claim extraction: a keyword check first, an LLM classifier
-   fallback for paraphrased abstentions it might miss. If the response is
-   already an abstention, `process_response()` returns `status="ABSTENTION"`
-   and leaves it untouched — the Blackboard never runs on it, so it can't
-   accidentally "correct" an honest hedge into a confident invented answer.
+   look, so an honest "I don't know" can score high without anything being
+   fabricated. `AbstentionDetector` runs before the risk gate: a keyword
+   check first, then an LLM classifier fallback for paraphrased abstentions
+   (off with `--no_llm_abstention`). An abstention is never "corrected"
+   into an invented answer. Instead, the system tries to *answer* the
+   question from evidence (`AnswerAgent`, or in the blackboard a new
+   hypothesis that must pass verification): status `ABSTENTION_RESOLVED`
+   if that works, otherwise the original abstention stands (`ABSTENTION`).
 
 ## Project structure
 
@@ -135,7 +188,12 @@ Environment variables:
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GROQ_API_KEY` | Yes | — | Powers the Verifier, Correction, and Claim Extraction agents. |
+| `GROQ_API_KEY` | Yes, unless `LLM_BASE_URL` points to a self-hosted server | — | Key for the default provider (Groq). |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `GROQ_MODEL` | No | Groq / — / `openai/gpt-oss-120b` | Any OpenAI-compatible provider (e.g. Ollama `http://localhost:11434/v1`, vLLM). |
+| `LLM_<ROLE>_MODEL` (+ `_BASE_URL`, `_API_KEY`) | No | default model | Per-agent models. ROLE = VERIFIER, ANSWER, CORRECTOR, EXTRACTOR, ABSTENTION, DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT, COMPOSER, BASELINE, JUDGE. |
+| `LLM_JSON_MODE` | No | `0` | `1` = request JSON objects from the server (recommended for small open models). |
+| `HALLUCIGUARD_CONTROLLER` | No | `blackboard` | Default controller for `process_response`: `blackboard`, `pipeline`, `cove`, `crag`. |
+| `BLACKBOARD_MAX_LLM_CALLS` | No | `8` | Per-question LLM-call budget of the blackboard (the eval's `--max_llm_calls` overrides it). |
 | `PROBE_PATH` | Yes (for `/ask`) | — | Path to a trained probe `.joblib` from `probe/train_probe.py`. |
 | `PROBE_LAYER` | No | `20` | Must match the layer the probe was trained on. |
 | `QWEN_MODEL_ID` | No | `Qwen/Qwen2.5-7B-Instruct` | Model the feature extractor loads. |

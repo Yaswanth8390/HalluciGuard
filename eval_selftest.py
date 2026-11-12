@@ -193,8 +193,8 @@ def test_stats_and_guards():
     assert ev.mcnemar_exact(0, 0) == 1.0 and ev.mcnemar_exact(10, 0) < 0.01
     # probe-training rows and duplicate questions are excluded
     import json as _j, tempfile as _t
-    rows = [{"question": f"Q{i}?", "right_answer": "a", "knowledge": "k"} for i in range(10)]
-    rows.append({"question": "Q3?", "right_answer": "a", "knowledge": "k"})   # duplicate
+    rows = [{"question": f"Q{i}?", "right_answer": "Paris", "knowledge": "k"} for i in range(10)]
+    rows.append({"question": "Q3?", "right_answer": "Paris", "knowledge": "k"})   # duplicate
     f = _t.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
     f.write("\n".join(_j.dumps(r) for r in rows)); f.close()
     recs = ev.load_dataset(f.name, "halueval", exclude_ids=set(range(0, 5)))
@@ -653,7 +653,76 @@ def test_kb_coverage():
     print("ok  domain-KB coverage: selection, KB contents, split report, kb_file, sweep table, checkpoint compat")
 
 
+def fake_llm_v2(prompt, **kw):
+    """fake_llm + the blackboard knowledge sources' prompts + the CoVe / CRAG baselines' prompts."""
+    if "You are the QueryReformulator" in prompt:
+        return json.dumps({"queries": [_between(prompt, "QUESTION")]})
+    if "You are the Decomposer" in prompt:
+        r = _between(prompt, "ASSISTANT_RESPONSE")
+        return json.dumps({"claims": [{"claim": r, "span": r}]})
+    if "You are the ClaimReviser" in prompt:
+        return json.dumps({"revised_claim": "", "evidence_ids": []})
+    if "You are the ConflictResolver" in prompt:
+        return json.dumps({"verdict": "SUPPORTED", "winner": "NONE", "confidence": 0.6, "explanation": "t"})
+    if "You are the Composer" in prompt:
+        return json.dumps({"response": "composed"})
+    if "Chain-of-Verification, step 2" in prompt:
+        return json.dumps({"questions": ["Is the draft right?"]})
+    if prompt.startswith("Answer the question concisely"):
+        return "Unknown"
+    if "finishing a Chain-of-Verification" in prompt:
+        return json.dumps({"final_answer": _between(prompt, "DRAFT_ANSWER")})
+    if "You are a retrieval evaluator" in prompt:
+        ids = re.findall(r"\[id=([^\]]+)\]", prompt)
+        return json.dumps({"labels": {i: "CORRECT" for i in ids}})
+    if "Answer the question using the knowledge below" in prompt:
+        kn = _between(prompt, "KNOWLEDGE")
+        return json.dumps({"final_answer": re.sub(r"\[id=[^\]]+\]\s*", "", kn).split("\n\n")[0]})
+    return fake_llm(prompt, **kw)
+
+
+def test_new_systems_through_eval():
+    """--system blackboard / cove / crag run end to end through eval_pipeline + blackboard_core."""
+    import blackboard_core as bc0
+    saved = dict(bc0.BLACKBOARD_ROLE_CALLERS), bc0.BASELINE_CALLER
+    for k in bc0.BLACKBOARD_ROLE_CALLERS:
+        bc0.BLACKBOARD_ROLE_CALLERS[k] = fake_llm_v2
+    bc0.BASELINE_CALLER = fake_llm_v2
+    try:
+        recs = ev.load_dataset(str(ROOT / "eval_data" / "sample_qa.jsonl"), "halueval")
+        wrong = {"What is the capital of Australia?": "Sydney", "Who discovered penicillin?": "Unknown",
+                 "Who wrote the play Hamlet?": "Marlowe"}
+        for r in recs:
+            r["answer"] = wrong.get(r["question"], r["gold"][0])
+            r["prob_hallucinated"] = 0.9 if r["question"] in wrong else 0.1
+        for system in ("blackboard", "cove", "crag"):
+            args = Namespace(threshold=0.70, default_score=1.0, chroma_dir=os.environ["CHROMA_PERSIST_DIRECTORY"],
+                             no_knowledge=False, oracle_knowledge=True, enable_web=False, isolate_memory=True,
+                             match="lenient", llm_judge=False, seed=0, workers=2, system=system, max_llm_calls=6,
+                             disable_ks=None)
+            rows, _ = ev.run_blackboard_stage(recs, args)
+            routed = [x for x, r in zip(rows, recs) if r["question"] in wrong]
+            assert all(x["status"] not in ("ERROR", "ERROR_FALLBACK") for x in rows), [x["error"] for x in rows]
+            assert all(x["llm_calls"] is not None and x["llm_calls"] <= 6 for x in routed), routed
+            assert sum(1 for x in rows if x["status"] == "SKIPPED_LOW_RISK") == len(recs) - len(wrong)
+            if system == "blackboard":
+                assert all(x.get("bb_cycles") for x in routed)
+                pen = next(x for x, r in zip(rows, recs) if r["question"] == "Who discovered penicillin?")
+                assert pen["status"] in ("ABSTENTION_RESOLVED", "ABSTENTION")
+            base = [ev.grade(r["answer"], r["gold"]) for r in recs]
+            bb = [ev.grade(x["final_response"], r["gold"]) for r, x in zip(recs, rows)]
+            rep = ev.build_report(recs, rows, base, bb, args)
+            assert rep["llm_calls"]["n_items"] == len(wrong) and rep["config"]["system"] == system
+            assert "system = " + system in ev.format_summary(rep)
+    finally:
+        bc0.BLACKBOARD_ROLE_CALLERS.clear()
+        bc0.BLACKBOARD_ROLE_CALLERS.update(saved[0])
+        bc0.BASELINE_CALLER = saved[1]
+    print("ok  --system blackboard / cove / crag end to end (budget, traces, statuses)")
+
+
 if __name__ == "__main__":
+    test_new_systems_through_eval()
     test_grading()
     test_processing_error_accounting()
     test_stats_and_guards()

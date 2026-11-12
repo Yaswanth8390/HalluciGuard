@@ -880,13 +880,23 @@ def kb_breakdown(records, base_labels, bb_labels) -> Optional[Dict[str, Any]]:
 
 STAGE2_KEYS = ("threshold", "default_score", "no_knowledge", "enable_web", "isolate_memory", "fallback_on_error",
                "llm_model", "llm_base_url", "llm_roles", "no_llm_abstention",
-               "kb_coverage", "kb_seed", "kb_file", "kb_file_sha256")
-_STAGE2_KEY_DEFAULTS = {"kb_coverage": None, "kb_seed": None, "kb_file": None, "kb_file_sha256": None}
+               "kb_coverage", "kb_seed", "kb_file", "kb_file_sha256", "system", "max_llm_calls", "disable_ks")
+# old checkpoints predate --system: they were made by the fixed pipeline
+_STAGE2_KEY_DEFAULTS = {"kb_coverage": None, "kb_seed": None, "kb_file": None, "kb_file_sha256": None,
+                        "system": "pipeline", "max_llm_calls": None, "disable_ks": None}
+
+
+def _stage2_meta(args) -> Dict[str, Any]:
+    out = {}
+    for k in STAGE2_KEYS:
+        v = getattr(args, k, None)
+        out[k] = _STAGE2_KEY_DEFAULTS.get(k) if v is None else v
+    return out
 
 
 def save_stage2_rows(path: Path, records, rows, args) -> None:
     """Checkpoint right after stage 2 so a crash/kill in grading or the control arm never costs a rerun."""
-    meta = {k: getattr(args, k, None) for k in STAGE2_KEYS}
+    meta = _stage2_meta(args)
     with open(path, "w", encoding="utf-8") as f:
         f.write(json.dumps({"_meta": meta}) + "\n")
         for r, x in zip(records, rows):
@@ -896,7 +906,7 @@ def save_stage2_rows(path: Path, records, rows, args) -> None:
 def load_stage2_rows(path: Path, records, args):
     lines = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     meta, saved = {**_STAGE2_KEY_DEFAULTS, **lines[0]["_meta"]}, lines[1:]
-    cur = {k: getattr(args, k, None) for k in STAGE2_KEYS}
+    cur = _stage2_meta(args)
     if meta != cur:
         raise SystemExit(f"--reuse_stage2: saved rows were made with different settings.\n  saved:   {meta}\n  current: {cur}")
     if [(x["id"], x["question"]) for x in saved] != [(r["id"], r["question"]) for r in records]:
@@ -999,8 +1009,19 @@ def run_blackboard_stage(records, args, partial_path=None):
     bc.orchestrator = _OrchProxy()
     print(f"[stage 2] using {bc.__file__}")
 
+    # blackboard controller / baselines for this run (same memory / web / budget settings as the pipeline arm)
+    system = getattr(args, "system", "pipeline")
+    if system != "pipeline":
+        disabled = [x for x in (getattr(args, "disable_ks", None) or "").split(",") if x]
+        bc.blackboard_controller = bc.build_blackboard_controller(
+            memory_agent=None if args.isolate_memory else bc.memory_agent,
+            web_search_agent=bc.web_search_agent if args.enable_web else None,
+            max_llm_calls=getattr(args, "max_llm_calls", None), disabled=disabled)
+        bc.BLACKBOARD_WRITE_MEMORY = not args.isolate_memory
+        print(f"[stage 2] system: {system}; blackboard config: {bc.blackboard_controller.config()}")
+
     # ---- per-item checkpoint: finished items survive a kill / disconnect / quota stop ----
-    meta = {k: getattr(args, k, None) for k in STAGE2_KEYS}
+    meta = _stage2_meta(args)
     reuse: Dict[Any, Dict[str, Any]] = {}
     plock = threading.Lock()
     pfile = None
@@ -1060,13 +1081,28 @@ def run_blackboard_stage(records, args, partial_path=None):
                     break
                 RateLimit.wait()
                 try:
-                    out = bc.process_response(prompt=r["question"], response=raw, confidence_score=score)
+                    import inspect
+                    try:
+                        takes = "controller" in inspect.signature(bc.process_response).parameters
+                    except (TypeError, ValueError):
+                        takes = False
+                    kw = {"controller": system} if takes or system != "pipeline" else {}
+                    out = bc.process_response(prompt=r["question"], response=raw, confidence_score=score, **kw)
                     row["status"] = out["status"]
                     row["final_response"] = out["final_response"]
                     row["evidence_source"] = out.get("evidence_source")
                     vr = out.get("verification_result") or {}
                     row["verdict"] = vr.get("verdict")
                     row["error"] = None
+                    bud = out.get("budget") or {}
+                    row["llm_calls"] = bud.get("llm_calls")
+                    row["cycles"] = bud.get("cycles")
+                    row["stop_reason"] = bud.get("stop_reason")
+                    tr = out.get("blackboard_trace") or {}
+                    if tr:   # compact trace: which KS ran, why, and how the hypotheses ended up
+                        row["bb_cycles"] = [{k: c.get(k) for k in ("ks", "target", "reason", "llm_calls", "note")}
+                                            for c in tr.get("cycles", [])]
+                        row["bb_hypotheses"] = tr.get("hypotheses")
                     break
                 except Exception as exc:  # one bad API call must not kill the run
                     row["error"] = f"{type(exc).__name__}: {exc}"[:300]
@@ -1173,6 +1209,16 @@ def paired_bootstrap(base: List[str], bb: List[str], iters: int = 2000, seed: in
     }
 
 
+def _call_stats(rows) -> Optional[Dict[str, Any]]:
+    """LLM calls per mitigated item (blackboard / baselines report it; the fixed pipeline does not)."""
+    xs = sorted(x["llm_calls"] for x in rows if x.get("llm_calls") is not None)
+    if not xs:
+        return None
+    stops = Counter(x.get("stop_reason") for x in rows if x.get("stop_reason"))
+    return {"n_items": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "max": xs[-1],
+            "total": sum(xs), "stop_reasons": dict(stops)}
+
+
 def build_report(records, rows, base_labels, bb_labels, args, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     base = arm_metrics(base_labels)
     bb = arm_metrics(bb_labels)
@@ -1205,7 +1251,11 @@ def build_report(records, rows, base_labels, bb_labels, args, extra: Optional[Di
             "isolate_memory": bool(args.isolate_memory),
             "match_mode": args.match,
             "llm_judge": bool(args.llm_judge),
+            "system": getattr(args, "system", "pipeline"),
+            "max_llm_calls": getattr(args, "max_llm_calls", None),
+            "disable_ks": getattr(args, "disable_ks", None),
         },
+        "llm_calls": _call_stats(rows),
         "without_blackboard": base,
         "with_blackboard": bb,
         "absolute_hallucination_reduction": abs_red,
@@ -1245,8 +1295,11 @@ def build_report(records, rows, base_labels, bb_labels, args, extra: Optional[Di
 def format_summary(rep: Dict[str, Any]) -> str:
     b, w = rep["without_blackboard"], rep["with_blackboard"]
     pct = lambda x: f"{100 * x:5.1f}%"
+    sysname = rep["config"].get("system") or "pipeline"
     lines = [
-        f"# Blackboard evaluation  (n={b['n']})",
+        f"# Mitigation evaluation: system = {sysname}  (n={b['n']})",
+        "",
+        "(\"with blackboard\" below = with the selected mitigation system)",
         "",
         "| metric | without blackboard | with blackboard |",
         "|---|---|---|",
@@ -1286,6 +1339,13 @@ def format_summary(rep: Dict[str, Any]) -> str:
               f"Failure basis (errors count as failures): {rep['paired_fixed_vs_broken_failure']['fixed']}/"
               f"{rep['paired_fixed_vs_broken_failure']['broken']}, p = {rep['mcnemar_exact_p_failure']:.4f}.",
               f"Knowledge base: {rep['config']['knowledge_base']}."]
+    lc = rep.get("llm_calls")
+    if lc:
+        lines.append(f"LLM calls per mitigated item: mean {lc['mean']:.2f}, median {lc['median']}, max {lc['max']} "
+                     f"(budget {rep['config'].get('max_llm_calls')}); stop reasons: "
+                     + ", ".join(f"{k}={v}" for k, v in sorted(lc["stop_reasons"].items())) + ".")
+    if rep["config"].get("disable_ks"):
+        lines.append(f"Ablation: knowledge sources disabled = {rep['config']['disable_ks']}.")
     rc = rep["routing_check"]
     lines.append(f"Routing check: {rc['abstention_path_items']} items went down the abstention path, "
                  f"{rc['abstention_path_but_not_abstention_by_grader']} of them were NOT abstentions by the grader; "
@@ -1400,6 +1460,15 @@ def main():
     bbg.add_argument("--enable_web", action="store_true", help="allow Tavily web-search fallback")
     bbg.add_argument("--isolate_memory", action="store_true",
                      help="every question sees an empty episodic memory (no cross-question leakage)")
+    bbg.add_argument("--system", default="blackboard", choices=["blackboard", "pipeline", "cove", "crag"],
+                     help="mitigation system: blackboard (control loop over a shared workspace), pipeline (the "
+                          "original fixed Orchestrator), or the re-implemented baselines cove / crag. Run once per "
+                          "system on the same generations, then compare_systems.py for paired tests.")
+    bbg.add_argument("--max_llm_calls", type=int, default=8,
+                     help="LLM-call budget per question for blackboard / cove / crag (ignored by pipeline)")
+    bbg.add_argument("--disable_ks", default="",
+                     help="ablation: comma-separated knowledge sources to switch off, from "
+                          "Memory,QueryReformulator,WebSearch,HypothesisGenerator,ConflictResolver")
     bbg.add_argument("--workers", type=int, default=8,
                      help="parallel questions in stage 2 (lower it if Groq returns 429s)")
 
@@ -1463,6 +1532,15 @@ def main():
     # only meaningful (and only recorded in the stage-2 checkpoint) when a fractional coverage is used
     args.kb_seed = (args.seed if args.kb_seed is None else args.kb_seed) if args.kb_coverage is not None else None
     args.kb_file_sha256 = _sha256(args.kb_file)
+    ks = sorted({x.strip() for x in args.disable_ks.split(",") if x.strip()})
+    allowed = {"Memory", "QueryReformulator", "WebSearch", "HypothesisGenerator", "ConflictResolver"}
+    if set(ks) - allowed:
+        ap.error(f"--disable_ks: unknown {sorted(set(ks) - allowed)}; choose from {sorted(allowed)}")
+    if ks and args.system != "blackboard":
+        ap.error("--disable_ks only applies to --system blackboard")
+    args.disable_ks = ",".join(ks) or None
+    if args.system == "pipeline":
+        args.max_llm_calls = None   # the fixed pipeline has no budget; keep its checkpoints comparable
     ex = probe_exclusions(args)
 
     if args.answers_file:
@@ -1598,12 +1676,21 @@ def main():
     with open(out_dir / "per_item.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["row_index", "question", "gold", "halueval_hallucinated_answer", "prob_hallucinated", "raw_answer", "raw_label",
-                    "status", "verdict", "evidence_source", "final_response", "final_label", "error", "group", "kb_covered"])
+                    "status", "verdict", "evidence_source", "final_response", "final_label", "error", "group", "kb_covered",
+                    "llm_calls", "stop_reason", "ks_sequence"])
         for r, x, bl, wl in zip(records, rows, base_labels, bb_labels):
             w.writerow([r["id"], r["question"], " | ".join(r["gold"]), r.get("hallucinated_answer", ""), r.get("prob_hallucinated", ""),
                         r["answer"], bl, x["status"], x["verdict"] or "", x["evidence_source"] or "",
                         x["final_response"], wl, x["error"] or "", r.get("group", ""),
-                        "" if r.get("kb_covered") is None else int(bool(r["kb_covered"]))])
+                        "" if r.get("kb_covered") is None else int(bool(r["kb_covered"])),
+                        "" if x.get("llm_calls") is None else x["llm_calls"], x.get("stop_reason") or "",
+                        " > ".join(c["ks"] for c in x.get("bb_cycles") or [])])
+    with open(out_dir / "traces.jsonl", "w", encoding="utf-8") as f:
+        for r, x in zip(records, rows):
+            if x.get("bb_cycles"):
+                f.write(json.dumps({"id": r["id"], "question": r["question"], "raw_answer": r["answer"],
+                                    "final_response": x["final_response"], "cycles": x["bb_cycles"],
+                                    "hypotheses": x.get("bb_hypotheses")}, ensure_ascii=False) + "\n")
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(report, f, indent=2)
     with open(out_dir / "summary.md", "w") as f:

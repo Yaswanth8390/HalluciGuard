@@ -34,3 +34,11 @@ scratch/
 # eval scratch
 eval_chroma/
 eval_runs/
+
+# generated eval data / caches (rebuild with prepare_eval_data.py / prepare_factscore.py)
+eval_data/wiki_cache.jsonl
+eval_data/popqa*.jsonl
+eval_data/bio*.jsonl
+eval_chroma*/
+runs/
+ollama.log
