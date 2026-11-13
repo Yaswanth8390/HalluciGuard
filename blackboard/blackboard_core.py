@@ -1375,10 +1375,18 @@ def _release_client(c):
         _INFLIGHT[id(c)] = max(0, _INFLIGHT.get(id(c), 1) - 1)
 
 
+_CALL_COUNTER = _threading.local()   # LLM calls made by the current thread (for cost accounting)
+
+
+def calls_so_far() -> int:
+    return getattr(_CALL_COUNTER, "n", 0)
+
+
 def _make_caller(clients, model, label):
     """clients: a list of OpenAI clients serving `model` (None = the default client(s), looked up at call
     time so tests / callers can swap `_groq_client`)."""
     def caller(prompt, *, temperature=0.0, response_mime_type=None, max_tokens=None, **kw):
+        _CALL_COUNTER.n = calls_so_far() + 1     # one logical call, however many retries it takes
         last = None
         limit = max_tokens or LLM_MAX_TOKENS
         extra = {"max_tokens": limit} if limit else {}
@@ -1670,6 +1678,16 @@ def _run_controller(controller: str, prompt: str, response: str, confidence_scor
 
 def process_response(prompt: str, response: str, confidence_score: float,
                      controller: Optional[str] = None) -> Dict[str, Any]:
+    """See _process_response. Adds `llm_calls_measured`: every LLM call this request made through the
+    module's callers (agents, abstention check, baselines), the same way for every controller."""
+    n0 = calls_so_far()
+    out = _process_response(prompt, response, confidence_score, controller)
+    out["llm_calls_measured"] = calls_so_far() - n0
+    return out
+
+
+def _process_response(prompt: str, response: str, confidence_score: float,
+                      controller: Optional[str] = None) -> Dict[str, Any]:
     """
     Top-level HalluciGuard interface — this is the integration point.
 

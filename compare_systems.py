@@ -72,14 +72,14 @@ def main():
     out = {"n": len(common), "reference": ref, "no_mitigation": rates(raw_labels), "systems": {}}
     pct = lambda v: f"{100 * v:.1f}"
     md = [f"# System comparison (n={len(common)} paired items, reference = {ref})", "",
-          "| system | accuracy | hallucination | abstention | LLM calls / mitigated item | Δ halluc. vs ref [95% CI] | Δ acc. vs ref [95% CI] | fixed / broken vs ref (McNemar p) |",
+          "| system | accuracy | hallucination | abstention | LLM calls / question | Δ halluc. vs ref [95% CI] | Δ acc. vs ref [95% CI] | fixed / broken vs ref (McNemar p) |",
           "|---|---|---|---|---|---|---|---|"]
     m0 = out["no_mitigation"]
     md.append(f"| no mitigation (raw) | {pct(m0['accuracy'])} | {pct(m0['hallucination'])} | {pct(m0['abstention'])} | 0 | | | |")
     for name, L in lab.items():
         m = rates(L)
         calls = [float(runs[name][k]["llm_calls"]) for k in common if runs[name][k].get("llm_calls") not in (None, "")]
-        m["llm_calls_mean"] = sum(calls) / len(calls) if calls else None
+        m["llm_calls_per_question"] = sum(calls) / len(calls) if calls else None
         if name != ref:
             R = lab[ref]
             fixed = sum(1 for a, b in zip(R, L) if a == HALLUCINATED and b != HALLUCINATED)
@@ -93,7 +93,7 @@ def main():
                     f"{fixed} / {broken} (p={v['mcnemar_p']:.4f})")
         else:
             cmp_ = "reference | | "
-        lc = "-" if m["llm_calls_mean"] is None else f"{m['llm_calls_mean']:.2f}"
+        lc = "-" if m["llm_calls_per_question"] is None else f"{m['llm_calls_per_question']:.2f}"
         md.append(f"| {name} | {pct(m['accuracy'])} | {pct(m['hallucination'])} | {pct(m['abstention'])} | {lc} | {cmp_} |")
         out["systems"][name] = m
     md += ["", "Δ = system minus reference; negative Δ hallucination = fewer hallucinations than the reference. "

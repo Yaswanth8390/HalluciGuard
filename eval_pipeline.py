@@ -1095,7 +1095,11 @@ def run_blackboard_stage(records, args, partial_path=None):
                     row["verdict"] = vr.get("verdict")
                     row["error"] = None
                     bud = out.get("budget") or {}
-                    row["llm_calls"] = bud.get("llm_calls")
+                    # measured calls (same accounting for every system, incl. the old pipeline);
+                    # fall back to the controller's own budget count with older blackboard_core versions
+                    # (max: a caller injected from outside, e.g. in tests, bypasses the counter)
+                    counts = [c for c in (out.get("llm_calls_measured"), bud.get("llm_calls")) if c is not None]
+                    row["llm_calls"] = max(counts) if counts else None
                     row["cycles"] = bud.get("cycles")
                     row["stop_reason"] = bud.get("stop_reason")
                     tr = out.get("blackboard_trace") or {}
@@ -1211,12 +1215,14 @@ def paired_bootstrap(base: List[str], bb: List[str], iters: int = 2000, seed: in
 
 def _call_stats(rows) -> Optional[Dict[str, Any]]:
     """LLM calls per mitigated item (blackboard / baselines report it; the fixed pipeline does not)."""
-    xs = sorted(x["llm_calls"] for x in rows if x.get("llm_calls") is not None)
+    skipped = ("SKIPPED_LOW_RISK", "EMPTY_ANSWER")
+    xs = sorted(x["llm_calls"] for x in rows if x.get("llm_calls") is not None and x["status"] not in skipped)
     if not xs:
         return None
+    total = sum(x["llm_calls"] for x in rows if x.get("llm_calls") is not None)
     stops = Counter(x.get("stop_reason") for x in rows if x.get("stop_reason"))
     return {"n_items": len(xs), "mean": sum(xs) / len(xs), "median": xs[len(xs) // 2], "max": xs[-1],
-            "total": sum(xs), "stop_reasons": dict(stops)}
+            "total": total, "per_question": total / max(1, len(rows)), "stop_reasons": dict(stops)}
 
 
 def build_report(records, rows, base_labels, bb_labels, args, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1341,7 +1347,8 @@ def format_summary(rep: Dict[str, Any]) -> str:
               f"Knowledge base: {rep['config']['knowledge_base']}."]
     lc = rep.get("llm_calls")
     if lc:
-        lines.append(f"LLM calls per mitigated item: mean {lc['mean']:.2f}, median {lc['median']}, max {lc['max']} "
+        lines.append(f"LLM calls: {lc.get('per_question', 0):.2f} per question overall; per mitigated item mean "
+                     f"{lc['mean']:.2f}, median {lc['median']}, max {lc['max']} "
                      f"(budget {rep['config'].get('max_llm_calls')}); stop reasons: "
                      + ", ".join(f"{k}={v}" for k, v in sorted(lc["stop_reasons"].items())) + ".")
     if rep["config"].get("disable_ks"):

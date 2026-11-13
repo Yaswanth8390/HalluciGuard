@@ -54,6 +54,19 @@ unchanged, kept as a baseline.
   (`kaggle_serve_agents.sh judge`). Each role is set with `LLM_<ROLE>_MODEL`; `LLM_JSON_MODE=1` makes the
   server return JSON objects.
 
+**Paper analysis tools:**
+
+| tool | what it gives the paper |
+|---|---|
+| `plot_cost_accuracy.py` | accuracy / hallucination vs. LLM calls per question for every system (budget sweep 4 / 8 / 16) |
+| `trace_report.py` | error analysis from the blackboard traces (fixed by a competing answer, wrong answer kept, over-abstention, no evidence, unusable model output, ...), with examples |
+| `judge_agreement.py` | exports judged facts for hand labelling (judge label hidden), then reports judge-vs-human and inter-annotator Cohen's kappa |
+| `compare_systems.py` | paired CIs and McNemar tests between systems |
+
+Every system's cost is measured the same way: `llm_calls_measured` counts each model call a request makes,
+including the old pipeline's. The notebook also repeats PopQA with a second generator family
+(`GEN2`, default Phi-3.5-mini) and on extra PopQA samples (`EXTRA_SEEDS`) to measure run-to-run variance.
+
 **Run it on Kaggle:** open `notebooks/kaggle_eval.ipynb` (GPU T4 x2, internet on) and run the cells top
 to bottom. Offline tests: `python -m pytest tests -q` and `python eval_selftest.py`.
 

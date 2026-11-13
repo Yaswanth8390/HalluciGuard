@@ -240,11 +240,14 @@ class QwenResidualFeatureExtractor:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": q},
             ]
-            formatted.append(
-                self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            )
+            try:
+                text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # some templates (e.g. Gemma, older Mistral) reject a system role: fold it into the user turn.
+                # Qwen's template accepts it, so Qwen prompts (and the probe's features) are unchanged.
+                merged = [{"role": "user", "content": f"{system_prompt}\n\n{q}"}]
+                text = self.tokenizer.apply_chat_template(merged, tokenize=False, add_generation_prompt=True)
+            formatted.append(text)
         return formatted
 
     def batch_generate_and_extract_features(
