@@ -30,7 +30,7 @@ def load_rows(path=None):
         r = requests.get(HF_URL, timeout=120)
         r.raise_for_status()
         text = r.text
-    return [json.loads(l) for l in text.splitlines() if l.strip()]
+    return [json.loads(l) for l in text.split("\n") if l.strip()]
 
 
 def main():

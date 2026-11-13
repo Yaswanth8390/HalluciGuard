@@ -126,11 +126,20 @@ def fetch_wikipedia(titles: Iterable[str], cache_path: Optional[str] = None, sle
     cache: Dict[str, str] = {}
     cp = Path(cache_path) if cache_path else None
     if cp and cp.exists():
-        for line in cp.read_text(encoding="utf-8").splitlines():
+        # split on "\n" only: str.splitlines() also breaks at U+2028 / U+0085, which occur in some articles
+        # and which json.dumps(ensure_ascii=False) leaves unescaped
+        bad = 0
+        for line in cp.read_text(encoding="utf-8").split("\n"):
             if line.strip():
-                row = json.loads(line)
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:   # e.g. a line cut off when a run was interrupted mid-write
+                    bad += 1
+                    continue
                 if row.get("text") or row.get("missing"):
                     cache[row["title"]] = row.get("text") or ""
+        if bad and verbose:
+            print(f"  skipped {bad} damaged cache lines (those articles are fetched again)")
     todo = [t for t in dict.fromkeys(titles) if t and t not in cache]
     sess = requests.Session()
     sess.headers["User-Agent"] = USER_AGENT

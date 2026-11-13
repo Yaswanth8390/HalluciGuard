@@ -32,7 +32,7 @@ BIO_SYSTEM_PROMPT = ("You are a helpful assistant. Answer with a short factual b
 
 
 def read_jsonl(p):
-    return [json.loads(l) for l in Path(p).read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [json.loads(l) for l in Path(p).read_text(encoding="utf-8").split("\n") if l.strip()]
 
 
 def write_jsonl(p, rows):

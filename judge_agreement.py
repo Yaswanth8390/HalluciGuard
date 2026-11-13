@@ -50,7 +50,7 @@ def cohen_kappa(a, b):
 
 
 def _read_jsonl(p):
-    return [json.loads(l) for l in Path(p).read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [json.loads(l) for l in Path(p).read_text(encoding="utf-8").split("\n") if l.strip()]
 
 
 def export(args):

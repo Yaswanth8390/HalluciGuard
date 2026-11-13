@@ -150,7 +150,7 @@ def aggregate(scored: List[Dict[str, Any]], gamma: int = 10) -> Dict[str, Any]:
 
 def load_kb_by_entity(kb_path: str) -> Dict[str, List[str]]:
     by = defaultdict(list)
-    for line in Path(kb_path).read_text(encoding="utf-8").splitlines():
+    for line in Path(kb_path).read_text(encoding="utf-8").split("\n"):
         if line.strip():
             r = json.loads(line)
             by[r["entity"]].append(r["text"])
@@ -183,7 +183,7 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    items = [json.loads(l) for l in Path(args.inp).read_text(encoding="utf-8").splitlines() if l.strip()]
+    items = [json.loads(l) for l in Path(args.inp).read_text(encoding="utf-8").split("\n") if l.strip()]
     caller, cfg = get_judge_caller()
     scored = score_many(items, args.field, load_kb_by_entity(args.kb), caller, args.judge_batch, args.workers)
     agg = aggregate(scored)

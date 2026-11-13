@@ -36,7 +36,7 @@ def read_local(path):
     text = p.read_text(encoding="utf-8").strip()
     if text.startswith("["):
         return json.loads(text)
-    return [json.loads(l) for l in text.splitlines() if l.strip()]
+    return [json.loads(l) for l in text.split("\n") if l.strip()]
 
 
 def norm(s):
