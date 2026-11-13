@@ -35,6 +35,13 @@ unchanged, kept as a baseline.
   head/torso/tail popularity terciles and builds a Wikipedia KB (`*_kb.jsonl`). Run
   `eval_pipeline.py --system <s>` once per system on the same generations, then use
   `compare_systems.py` for paired bootstrap CIs and McNemar tests. Ablations use `--disable_ks`.
+- **Probe gate (detection -> mitigation):** with `--probe`, only answers the probe flags (and
+  abstentions) are mitigated. `prepare_eval_data.py --dev N` writes a disjoint PopQA dev split, and
+  `choose_threshold.py` picks the threshold there (max F1 / Youden / a recall target, plus dev AUROC),
+  never on the eval rows. Pass `--probe` again in stage 2 so the train/test-overlap guard can read the
+  probe's `train_questions`. The eval reports the probe's AUROC and precision/recall on the held-out
+  answers. Comparing a gated run against `--threshold 0` (mitigate everything) shows what the gate saves
+  in LLM calls and in avoided "correct -> wrong" damage.
 - **FActScore biographies** (as in CoVe / Self-RAG / CRAG / EVER): `prepare_factscore.py` (500 entities
   plus their Wikipedia text from HF `dskar/FActScore`), then `eval_bio.py`, which reports FActScore,
   FActScore with gamma=10, % responding, facts per response, and LLM calls. Scoring is done by

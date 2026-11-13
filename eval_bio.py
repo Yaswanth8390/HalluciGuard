@@ -184,7 +184,17 @@ def main():
                 if a_.get("score") is not None and b_.get("score") is not None]
         paired[tag] = paired_ci([x for x, _ in both], [y for _, y in both])
 
-    metrics = {"n": len(records), "systems": table, "paired_vs_raw": paired, "judge": judge_cfg,
+    # does the probe score (trained on short answers) say anything about long-form factuality?
+    probe_rep = None
+    pp = [(r["prob_hallucinated"], s["score"]) for r, s in zip(records, raw_scores)
+          if r.get("prob_hallucinated") is not None and s.get("score") is not None]
+    if len(pp) >= 10:
+        med = sorted(x for _, x in pp)[len(pp) // 2]
+        low = [int(x < med) for _, x in pp]
+        probe_rep = {"n": len(pp), "auroc_low_factscore": ev.auroc([p for p, _ in pp], low),
+                     "definition": "positive = raw FActScore below the median", "median_factscore": med}
+    metrics = {"probe_vs_factscore": probe_rep,
+               "n": len(records), "systems": table, "paired_vs_raw": paired, "judge": judge_cfg,
                "max_llm_calls": args.max_llm_calls, "disable_ks": disabled, "threshold": args.threshold,
                "knowledge_source": "dskar/FActScore Wikipedia text (scraped 2025-07-29)"}
     with open(out / "metrics.json", "w") as f:
@@ -199,6 +209,9 @@ def main():
         lc = m.get("llm_calls_mean")
         lines.append(f"| {tag} | {pct(m['factscore'])} | {pct(m.get('factscore_gamma10'))} | {pct(m['response_ratio'])} | "
                      f"{m['facts_per_response']:.1f} | {'-' if lc is None else f'{lc:.1f}'} | {ch} |")
+    if probe_rep and probe_rep["auroc_low_factscore"] is not None:
+        lines += ["", f"Probe on long-form answers: AUROC {probe_rep['auroc_low_factscore']:.3f} for flagging "
+                      f"below-median raw FActScore (n={probe_rep['n']}); the probe was trained on short answers."]
     lines += ["", f"Judge: {judge_cfg}. Knowledge source: {metrics['knowledge_source']}.",
               "FActScore is computed over responses that did not abstain; read it together with % responding."]
     (out / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

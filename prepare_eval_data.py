@@ -82,7 +82,9 @@ def load_triviaqa(path=None):
     return list(load_dataset("mandarjoshi/trivia_qa", "unfiltered.nocontext", split="validation"))
 
 
-def build_popqa(rows, n, seed):
+def build_popqa(rows, n, seed, n_dev=0):
+    """n eval items + n_dev disjoint dev items (for choosing the probe threshold), equal per tercile.
+    The eval sample is the same whatever n_dev is: dev items come after it in each shuffled pool."""
     items = []
     for r in rows:
         ans = clean_aliases(parse_list(r.get("possible_answers")))
@@ -98,14 +100,16 @@ def build_popqa(rows, n, seed):
     for x in items:
         x["group"] = "tail" if x["s_pop"] < lo else ("torso" if x["s_pop"] < hi else "head")
     rng = random.Random(seed)
-    per = n // 3
-    out = []
+    per, dper = n // 3, n_dev // 3
+    out, dev = [], []
     for g in ("head", "torso", "tail"):
         pool = [x for x in items if x["group"] == g]
         rng.shuffle(pool)
         out += pool[:per]
+        dev += pool[per:per + dper]
     rng.shuffle(out)
-    return out
+    rng.shuffle(dev)
+    return out, dev
 
 
 def build_triviaqa(rows, n, seed):
@@ -159,6 +163,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--popqa_file")
     ap.add_argument("--triviaqa_file")
+    ap.add_argument("--dev", type=int, default=0,
+                    help="PopQA: also write N disjoint dev questions to <out>_dev.jsonl (choose the probe threshold "
+                         "there with choose_threshold.py, never on the eval rows)")
     ap.add_argument("--wiki", action="store_true",
                     help="PopQA: fetch each subject's Wikipedia article. Sets `knowledge` to the passage that contains "
                          "a gold answer (for --kb_coverage) and writes every passage to --kb_out (for --kb_file)")
@@ -169,9 +176,15 @@ def main():
     args = ap.parse_args()
 
     if args.dataset == "popqa":
-        out = build_popqa(load_popqa(args.popqa_file), args.n, args.seed)
+        out, dev = build_popqa(load_popqa(args.popqa_file), args.n, args.seed, args.dev)
         if args.wiki:
             add_wikipedia(out, args)
+        if dev:
+            dev_path = Path(str(Path(args.out).with_suffix("")) + "_dev.jsonl")
+            with open(dev_path, "w", encoding="utf-8") as f:
+                for x in dev:
+                    f.write(json.dumps(x, ensure_ascii=False) + "\n")
+            print(f"wrote {len(dev)} dev rows (disjoint from the eval rows) -> {dev_path}")
     else:
         out = build_triviaqa(load_triviaqa(args.triviaqa_file), args.n, args.seed)
 
