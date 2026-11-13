@@ -7,9 +7,14 @@ compare_systems.py - paired comparison of several eval_pipeline.py runs on the S
 
 Each run directory must hold per_item.csv (written by eval_pipeline.py). Rows are paired by row_index.
 For every system: accuracy / hallucination / abstention (raw answers shown once as "no mitigation"),
-LLM calls per mitigated item, and versus --reference: paired-bootstrap 95% CIs of the hallucination-rate
+hallucination among answered (wrong / (correct + wrong)), LLM calls per mitigated item, and versus --reference: paired-bootstrap 95% CIs of the hallucination-rate
 and accuracy differences and an exact McNemar test on hallucinations (fixed vs broken items).
+
+--keep_abstentions cove crag adds derived rows "cove (abstentions kept)": the same run, but every item whose
+raw answer was an abstention keeps that abstention (as if the system were never run on it, 0 LLM calls).
+It needs no rerun and shows how much of a system's hallucination rate comes from turning "Unknown" into guesses.
 """
+import copy
 import argparse
 import csv
 import json
@@ -28,8 +33,19 @@ def load(run_dir):
 
 def rates(labels):
     n = len(labels) or 1
+    answered = labels.count(CORRECT) + labels.count(HALLUCINATED)
     return {"n": len(labels), "accuracy": labels.count(CORRECT) / n, "hallucination": labels.count(HALLUCINATED) / n,
-            "abstention": labels.count(ABSTAINED) / n, "errors": labels.count(PROCESSING_ERROR) / n}
+            "abstention": labels.count(ABSTAINED) / n, "errors": labels.count(PROCESSING_ERROR) / n,
+            "halluc_among_answered": labels.count(HALLUCINATED) / answered if answered else None}
+
+
+def keep_abstentions(run):
+    """Derived run: items whose raw answer was an abstention keep it (system not applied to them)."""
+    out = copy.deepcopy(run)
+    for r in out.values():
+        if r["raw_label"] == ABSTAINED:
+            r["final_label"], r["final_response"], r["llm_calls"] = ABSTAINED, r["raw_answer"], "0"
+    return out
 
 
 def boot(a, b, fn, iters=2000, seed=0):
@@ -47,6 +63,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--runs", nargs="+", required=True, help="name=run_dir ...")
     ap.add_argument("--reference", default=None, help="system to compare against (default: first)")
+    ap.add_argument("--keep_abstentions", nargs="*", default=[], metavar="NAME",
+                    help="also report NAME with raw abstentions left untouched (derived from the same per_item.csv)")
     ap.add_argument("--out", default=None, help="write the markdown table here (+ .json next to it)")
     args = ap.parse_args()
 
@@ -54,6 +72,10 @@ def main():
     for spec in args.runs:
         name, _, d = spec.partition("=")
         runs[name] = load(d)
+    for name in args.keep_abstentions:
+        if name not in runs:
+            raise SystemExit(f"--keep_abstentions {name}: not among --runs")
+        runs[f"{name} (abstentions kept)"] = keep_abstentions(runs[name])
     ref = args.reference or next(iter(runs))
     common = sorted(set.intersection(*(set(r) for r in runs.values())), key=lambda x: int(x) if x.isdigit() else x)
     if not common:
@@ -70,12 +92,12 @@ def main():
     hal = lambda L: L.count(HALLUCINATED) / len(L)
     acc = lambda L: L.count(CORRECT) / len(L)
     out = {"n": len(common), "reference": ref, "no_mitigation": rates(raw_labels), "systems": {}}
-    pct = lambda v: f"{100 * v:.1f}"
+    pct = lambda v: "-" if v is None else f"{100 * v:.1f}"
     md = [f"# System comparison (n={len(common)} paired items, reference = {ref})", "",
-          "| system | accuracy | hallucination | abstention | LLM calls / question | Δ halluc. vs ref [95% CI] | Δ acc. vs ref [95% CI] | fixed / broken vs ref (McNemar p) |",
-          "|---|---|---|---|---|---|---|---|"]
+          "| system | accuracy | hallucination | abstention | halluc. among answered | LLM calls / question | Δ halluc. vs ref [95% CI] | Δ acc. vs ref [95% CI] | fixed / broken vs ref (McNemar p) |",
+          "|---|---|---|---|---|---|---|---|---|"]
     m0 = out["no_mitigation"]
-    md.append(f"| no mitigation (raw) | {pct(m0['accuracy'])} | {pct(m0['hallucination'])} | {pct(m0['abstention'])} | 0 | | | |")
+    md.append(f"| no mitigation (raw) | {pct(m0['accuracy'])} | {pct(m0['hallucination'])} | {pct(m0['abstention'])} | {pct(m0['halluc_among_answered'])} | 0 | | | |")
     for name, L in lab.items():
         m = rates(L)
         calls = [float(runs[name][k]["llm_calls"]) for k in common if runs[name][k].get("llm_calls") not in (None, "")]
@@ -94,7 +116,7 @@ def main():
         else:
             cmp_ = "reference | | "
         lc = "-" if m["llm_calls_per_question"] is None else f"{m['llm_calls_per_question']:.2f}"
-        md.append(f"| {name} | {pct(m['accuracy'])} | {pct(m['hallucination'])} | {pct(m['abstention'])} | {lc} | {cmp_} |")
+        md.append(f"| {name} | {pct(m['accuracy'])} | {pct(m['hallucination'])} | {pct(m['abstention'])} | {pct(m['halluc_among_answered'])} | {lc} | {cmp_} |")
         out["systems"][name] = m
     md += ["", "Δ = system minus reference; negative Δ hallucination = fewer hallucinations than the reference. "
                "Fixed/broken count items the reference got wrong and the system did not, and vice versa."]
