@@ -55,6 +55,11 @@ def test_trace_categories():
     assert {"no_evidence", "unusable_model_output", "budget_exhausted", "over_abstention"} <= set(cats)
     kept = _trace(("Retrieval", "5 passages (5 new) for Q1"), ("Verifier", "SUPPORTED (0.80)"), ("Composer", "keep"))
     assert tr.categorize(_row("HALLUCINATED", "HALLUCINATED"), kept)[0] == ["wrong_answer_kept"]
+    blocked = _trace(("Retrieval", "5 passages (5 new) for Q1"), ("Verifier", "SUPPORTED (0.90)"),
+                     ("Confirmer", "INSUFFICIENT (0.80)"), ("HypothesisGenerator",
+                      "proposed answer 'X' is not written in the evidence; discarded"), ("Composer", "abstain"))
+    cats = tr.categorize(_row("HALLUCINATED", "ABSTAINED"), blocked)[0]
+    assert cats == ["fixed_by_abstaining", "second_model_disagreed", "ungrounded_answer_discarded"]
 
 
 def _metrics(path, acc, hal, per_q, budget):

@@ -60,6 +60,10 @@ def categorize(row, trace):
         cats.append("correct_answer_replaced")
     if raw == CORRECT and fin == ABSTAINED:
         cats.append("over_abstention")
+    if any(c.get("ks") == "Confirmer" and not str(c.get("note") or "").startswith("SUPPORTED") for c in cycles):
+        cats.append("second_model_disagreed")
+    if any("not written in the evidence" in n for n in notes):
+        cats.append("ungrounded_answer_discarded")
     return cats, mode, passages
 
 

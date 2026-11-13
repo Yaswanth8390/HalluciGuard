@@ -171,20 +171,26 @@ DOCS = [("d1", "Canberra is the capital city of Australia."),
 TABLE = {"What is the capital of Australia?": "Canberra", "Who discovered penicillin?": "Alexander Fleming"}
 
 
-def make(docs=DOCS, web=None, verifier=None, max_calls=8, disabled=(), memory=None):
+def make(docs=DOCS, web=None, verifier=None, max_calls=8, disabled=(), memory=None, confirmer=None,
+         answer=None, **kw):
+    """confirmer: fn(prompt) -> JSON for the Confirmer (VERIFIER2); None = no Confirmer, as before."""
     llm = Counter(fake_llm)
-    agents = dict(retrieval=FakeRetrieval(docs), verifier=verifier or FakeVerifier(), answer=FakeAnswer(TABLE),
-                  correction=FakeCorrection(), llm=llm)
+    agents = dict(retrieval=FakeRetrieval(docs), verifier=verifier or FakeVerifier(),
+                  answer=answer or FakeAnswer(TABLE), correction=FakeCorrection(), llm=llm,
+                  confirm=Counter(confirmer) if confirmer else None)
+    callers = {r: llm for r in ("DECOMPOSER", "REFORMULATOR", "HYPOTHESIS", "CONFLICT", "COMPOSER")}
+    if confirmer:
+        callers["VERIFIER2"] = agents["confirm"]
     ctl = build_controller(retrieval_agent=agents["retrieval"], verifier_agent=agents["verifier"],
                            answer_agent=agents["answer"], correction_agent=agents["correction"],
-                           memory_agent=memory, web_search_agent=web,
-                           callers={r: llm for r in ("DECOMPOSER", "REFORMULATOR", "HYPOTHESIS", "CONFLICT", "COMPOSER")},
-                           max_llm_calls=max_calls, disabled=disabled)
+                           memory_agent=memory, web_search_agent=web, callers=callers,
+                           max_llm_calls=max_calls, disabled=disabled, **kw)
     return ctl, agents
 
 
 def total_calls(a):
-    return a["verifier"].calls + a["answer"].calls + a["correction"].calls + a["llm"].n
+    return (a["verifier"].calls + a["answer"].calls + a["correction"].calls + a["llm"].n
+            + (a["confirm"].n if a["confirm"] else 0))
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +328,152 @@ def test_trace_explains_every_cycle():
     for c in out["blackboard_trace"]["cycles"]:
         assert c["ks"] and c["reason"] is not None
     json.dumps(out["blackboard_trace"])   # serializable
+
+
+# ---------------------------------------------------------------------------
+# cross-model confirmation + entity / answer grounding
+# ---------------------------------------------------------------------------
+from knowledge_sources import grounded_in, on_topic  # noqa: E402
+
+
+def confirm_says(label, conf=0.9):
+    def fn(prompt, **kw):
+        assert "You are the Confirmer" in prompt
+        return json.dumps({"verdict": label, "confidence": conf, "evidence_ids": [], "explanation": "fake"})
+    return fn
+
+
+def confirm_if_written(prompt, **kw):
+    """Agrees when the claimed answer is written in the evidence, else INSUFFICIENT."""
+    assert "You are the Confirmer" in prompt
+    ans = _between(prompt, "CLAIM").split("is:")[-1].strip().lower().rstrip(".")
+    ok = ans and ans in _between(prompt, "EVIDENCE").lower()
+    return json.dumps({"verdict": "SUPPORTED" if ok else "INSUFFICIENT", "confidence": 0.9, "explanation": ""})
+
+
+class YesVerifier(FakeVerifier):
+    """A lenient first verifier: SUPPORTED whenever there is any evidence (the failure seen on PopQA)."""
+    def verify(self, board):
+        self.calls += 1
+        ev = board.read("retrieved_evidence", [])
+        if not ev:
+            return {"verdict": "INSUFFICIENT", "explanation": "", "supporting_evidence_ids": [], "confidence": 0.3}
+        return {"verdict": "SUPPORTED", "explanation": "", "supporting_evidence_ids": [ev[0]["id"]], "confidence": 0.9}
+
+
+def _ks(out):
+    return [c["ks"] for c in out["blackboard_trace"]["cycles"]]
+
+
+def test_helpers_entity_and_answer_grounding():
+    q = "Who was the composer of Black Patch?"
+    assert on_topic(q, "Black Patch: Black Patch is a 1957 western film.") is True
+    assert on_topic(q, "Black Sabbath: Black Sabbath were an English rock band.") is False
+    assert on_topic("Who was the director of Murder?", "Murder (1930 film): Murder! is a 1930 thriller.") is True
+    assert on_topic(q, "Canberra is the capital city of Australia.") is None     # untitled: unknown
+    ev = [{"id": "e1", "text": "Murder (1930 film): directed by Alfred Hitchcock."}]
+    assert grounded_in("Alfred Hitchcock", ev) and grounded_in("Hitchcock", ev)
+    assert grounded_in("footballer", [{"id": "e", "text": "X: X played association football."}])
+    assert grounded_in("Jerry Goldsmith", ev) is None
+    assert grounded_in("1951", [{"id": "e", "text": "X: born in 1950."}]) is None
+
+
+def test_high_risk_answer_needs_a_second_model_to_agree():
+    ctl, a = make(confirmer=confirm_says("SUPPORTED"))
+    out = ctl.run("What is the capital of Australia?", "Canberra", 0.9)
+    assert out["final_response"] == "Canberra" and out["budget"]["stop_reason"] == "solved"
+    assert _ks(out).count("Confirmer") == 1 and a["confirm"].n == 1
+    assert out["verification_result"]["claims"][0]["confirmation"] == "confirmed"
+    assert out["budget"]["llm_calls"] == total_calls(a) == 2
+
+
+def test_low_risk_answer_is_accepted_on_one_check():
+    ctl, a = make(confirmer=confirm_says("SUPPORTED"), confirm_risk=0.5)
+    out = ctl.run("What is the capital of Australia?", "Canberra", 0.3)
+    assert out["final_response"] == "Canberra" and "Confirmer" not in _ks(out)
+    assert out["budget"]["llm_calls"] == total_calls(a) == 1
+
+
+def test_second_model_disagreeing_blocks_a_wrong_answer():
+    """The lenient first verifier supports Sydney; the Confirmer does not -> no hallucinated answer."""
+    ctl, a = make(verifier=YesVerifier(), confirmer=confirm_says("INSUFFICIENT"))
+    out = ctl.run("What is the capital of Australia?", "Sydney", 0.9)
+    assert out["final_response"] == "I'm not sure."
+    assert not [h for h in out["blackboard_trace"]["hypotheses"] if h["status"] == ACCEPTED]
+    assert out["budget"]["llm_calls"] == total_calls(a) <= 8
+
+
+def test_without_confirmer_the_lenient_verifier_lets_it_through():
+    ctl, a = make(verifier=YesVerifier())
+    assert ctl.run("What is the capital of Australia?", "Sydney", 0.9)["final_response"] == "Sydney"
+
+
+def test_confirmer_contradiction_goes_to_the_resolver():
+    ctl, a = make(confirmer=confirm_says("CONTRADICTED"))
+    out = ctl.run("What is the capital of Australia?", "Canberra", 0.9)
+    ws = out["blackboard_trace"]["workspace"]["entries"]
+    assert [e for e in ws if e["kind"] == "conflict" and e["about"] == "claim"]
+    assert "ConflictResolver" in _ks(out)
+    assert out["final_response"] == "Canberra"     # the fake resolver sides with SUPPORTED
+
+
+def test_evidence_answer_is_always_confirmed():
+    """Even with a low-risk base answer, a competitor read off the evidence needs the second model."""
+    ctl, a = make(confirmer=confirm_if_written, confirm_risk=0.95)
+    out = ctl.run("What is the capital of Australia?", "Sydney", 0.6)
+    assert out["final_response"] == "Canberra"
+    assert _ks(out).count("Confirmer") == 1        # only for the evidence answer, not for Sydney
+
+
+BLACK_PATCH = [("b1", "Black Sabbath: Black Sabbath music was written by Tony Iommi, the composer of the band."),
+               ("b2", "Black Patch: Black Patch is a 1957 American western film about a black patch.")]
+
+
+class HallucinatingAnswer(FakeAnswer):
+    """Reads an answer off ANY passage, or makes one up (what the 8B models did on PopQA)."""
+    def attempt_answer(self, board):
+        self.calls += 1
+        ev = board.read("retrieved_evidence", [])
+        text = " ".join(e["text"] for e in ev)
+        ans = "Tony Iommi" if "Tony Iommi" in text else "Jerry Goldsmith"
+        return {"verdict": "ANSWER_FOUND", "answer": ans, "explanation": "", "supporting_evidence_ids": [ev[0]["id"]]}
+
+
+def test_off_topic_passage_cannot_propose_an_answer():
+    q = "Who was the composer of Black Patch?"
+    ctl, a = make(docs=BLACK_PATCH, answer=HallucinatingAnswer({}), grounding=False)
+    assert ctl.run(q, "Unknown", 0.9, abstention=True)["final_response"] == "Tony Iommi"   # the failure
+    ctl, a = make(docs=BLACK_PATCH, answer=HallucinatingAnswer({}))
+    out = ctl.run(q, "Unknown", 0.9, abstention=True)
+    assert out["status"] == "ABSTENTION" and out["final_response"] == "Unknown"
+    notes = [c["note"] for c in out["blackboard_trace"]["cycles"] if c["ks"] == "HypothesisGenerator"]
+    assert notes and "not written in the evidence" in notes[0]    # Jerry Goldsmith is not in b2
+
+
+def test_confirmer_needs_a_passage_about_the_entity():
+    """The first verifier supports Tony Iommi from the Black Sabbath passage; the Confirmer sees no
+    passage about Black Patch that names him and rejects without an LLM call."""
+    ctl, a = make(docs=BLACK_PATCH, verifier=YesVerifier(), confirmer=confirm_says("SUPPORTED"))
+    out = ctl.run("Who was the composer of Black Patch?", "Tony Iommi", 0.9)
+    assert out["final_response"] == "I'm not sure."
+    assert a["confirm"].n == 0 and "Confirmer" in _ks(out)
+    assert out["budget"]["llm_calls"] == total_calls(a)
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3, 4])
+def test_budget_is_never_exceeded_with_confirmer(budget):
+    ctl, a = make(max_calls=budget, confirmer=confirm_if_written)
+    out = ctl.run("What is the capital of Australia?", "Sydney", 0.9)
+    assert total_calls(a) == out["budget"]["llm_calls"] <= budget
+    assert out["final_response"] in ("Canberra", "I'm not sure.")      # never an unconfirmed answer
+
+
+def test_long_form_revision_needs_confirmation():
+    bio = "Ada Smith is a chemist. Ada Smith was born in 1960."
+    ctl, a = make(max_calls=20, confirmer=confirm_says("INSUFFICIENT"))
+    out = ctl.run("Tell me a bio of Ada Smith.", bio, 0.8, form="long")
+    assert "1950" not in out["final_response"] and "1960" not in out["final_response"]   # removed, not swapped
+    ctl, a = make(max_calls=20, confirmer=confirm_says("SUPPORTED"))
+    out = ctl.run("Tell me a bio of Ada Smith.", bio, 0.8, form="long")
+    assert "1950" in out["final_response"] and "1960" not in out["final_response"]
+    assert out["budget"]["llm_calls"] == total_calls(a) <= 20

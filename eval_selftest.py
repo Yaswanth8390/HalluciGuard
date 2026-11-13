@@ -711,6 +711,10 @@ def fake_llm_v2(prompt, **kw):
         return json.dumps({"revised_claim": "", "evidence_ids": []})
     if "You are the ConflictResolver" in prompt:
         return json.dumps({"verdict": "SUPPORTED", "winner": "NONE", "confidence": 0.6, "explanation": "t"})
+    if "You are the Confirmer" in prompt:   # agrees when the claimed answer is written in the evidence
+        ans = _between(prompt, "CLAIM").split("is:")[-1].strip().lower()
+        ok = bool(ans) and ans in _between(prompt, "EVIDENCE").lower()
+        return json.dumps({"verdict": "SUPPORTED" if ok else "INSUFFICIENT", "confidence": 0.9, "explanation": "t"})
     if "You are the Composer" in prompt:
         return json.dumps({"response": "composed"})
     if "Chain-of-Verification, step 2" in prompt:

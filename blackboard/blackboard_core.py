@@ -1545,21 +1545,30 @@ DEFAULT_CONTROLLER = os.getenv("HALLUCIGUARD_CONTROLLER", "blackboard").strip().
 if DEFAULT_CONTROLLER not in CONTROLLERS:
     raise RuntimeError(f"HALLUCIGUARD_CONTROLLER must be one of {CONTROLLERS}, got {DEFAULT_CONTROLLER!r}")
 
-BLACKBOARD_ROLE_CALLERS = {r: _role_caller(r) for r in ("DECOMPOSER", "REFORMULATOR", "HYPOTHESIS", "CONFLICT", "COMPOSER")}
+# VERIFIER2 = the Confirmer (independent second check before an answer is accepted); point it at a
+# different model family than VERIFIER, e.g. LLM_VERIFIER2_MODEL=mistral:7b when VERIFIER is Llama
+BLACKBOARD_ROLE_CALLERS = {r: _role_caller(r) for r in
+                           ("DECOMPOSER", "REFORMULATOR", "HYPOTHESIS", "CONFLICT", "COMPOSER", "VERIFIER2")}
+BLACKBOARD_CONFIRM_RISK = float(os.getenv("BLACKBOARD_CONFIRM_RISK", "0.5"))
+BLACKBOARD_GROUNDING = os.getenv("BLACKBOARD_GROUNDING", "1").strip().lower() not in ("0", "false", "no")
 BASELINE_CALLER = _role_caller("BASELINE")   # CoVe / CRAG use one model, like in their papers
 
 
 def build_blackboard_controller(*, memory_agent=memory_agent, web_search_agent=web_search_agent,
-                                max_llm_calls=None, disabled=(), **kw):
+                                max_llm_calls=None, disabled=(), confirm_risk=None, grounding=None, **kw):
     """A fresh controller (use one per experiment setting). Pass memory_agent=None to run without
-    episodic memory, web_search_agent=None to stay offline, disabled=[KS names] for ablations."""
+    episodic memory, web_search_agent=None to stay offline, disabled=[KS names] for ablations,
+    confirm_risk (probe score from which the base answer needs the Confirmer too) and grounding
+    (entity / answer grounding on or off)."""
     if web_search_agent is not None and not getattr(web_search_agent, "enabled", False):
         web_search_agent = None
     return bb_control.build_controller(
         retrieval_agent=retrieval_agent, verifier_agent=verifier_agent, answer_agent=answer_agent,
         correction_agent=correction_agent, memory_agent=memory_agent, web_search_agent=web_search_agent,
         callers=BLACKBOARD_ROLE_CALLERS, max_llm_calls=max_llm_calls, disabled=disabled,
-        retrieval_top_k=RETRIEVAL_TOP_K, **kw)
+        retrieval_top_k=RETRIEVAL_TOP_K,
+        confirm_risk=BLACKBOARD_CONFIRM_RISK if confirm_risk is None else confirm_risk,
+        grounding=BLACKBOARD_GROUNDING if grounding is None else grounding, **kw)
 
 
 blackboard_controller = build_blackboard_controller()

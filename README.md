@@ -9,7 +9,7 @@ control, as in classic blackboard systems:
 | piece | file | role |
 |---|---|---|
 | Workspace | `blackboard/workspace.py` | typed entries: question, competing **hypotheses** (candidate answers), atomic **claims**, queries, evidence, verdicts, conflicts; every write is logged |
-| Knowledge sources | `blackboard/knowledge_sources.py` | Decomposer, Memory, Retrieval, QueryReformulator, WebSearch, Verifier, HypothesisGenerator, ConflictResolver, Composer. Each one says what it *could* do given the board and acts only when picked |
+| Knowledge sources | `blackboard/knowledge_sources.py` | Decomposer, Memory, Retrieval, QueryReformulator, WebSearch, Verifier, Confirmer, HypothesisGenerator, ConflictResolver, Composer. Each one says what it *could* do given the board and acts only when picked |
 | Control | `blackboard/control.py` | each cycle: recompute claim/hypothesis status from verdicts, post conflicts, stop if solved or out of budget, else run the highest-priority activation (`stage weight x (0.5 + risk) / (1 + LLM cost)`) |
 | Baselines | `blackboard/baselines.py` | CoVe (factored) and CRAG-style corrective RAG on the same models + KB |
 
@@ -19,6 +19,17 @@ What the blackboard does that the old pipeline could not:
   verified, the system abstains.
 - **Adaptive search.** An INSUFFICIENT claim triggers query reformulation (then web search), instead of
   just fetching more of the same results.
+- **Two independent checks before an answer is accepted (Confirmer).** One SUPPORTED verdict is not
+  enough for an answer read off the evidence (it would mostly confirm itself), nor for a base answer
+  the probe scores as risky (risk >= `--confirm_risk`, default 0.5). A second model family must agree,
+  judging only passages about the question's entity and without seeing the first verdict. If it does
+  not agree, the answer is not accepted (more search, a competing answer, or an abstention); if it
+  contradicts, the ConflictResolver decides. Low-risk base answers keep the one-check fast path, so the
+  probe sets how much evidence an answer needs.
+- **Entity and answer grounding (no LLM calls).** KB passages start with their article title. Only
+  passages whose title names the question's entity may propose or confirm an answer, so a passage about
+  a different film, band or person with a similar name cannot. A proposed answer must also be written in
+  that evidence. Ablation: `--no_grounding`.
 - **Conflicts.** Independent verdicts from different sources that disagree become a conflict entry,
   which a resolver from a different model family settles.
 - **Long answers.** Every claim gets its own entry. Contradicted claims get a revision that is
@@ -214,7 +225,7 @@ Environment variables:
 |---|---|---|---|
 | `GROQ_API_KEY` | Yes, unless `LLM_BASE_URL` points to a self-hosted server | — | Key for the default provider (Groq). |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `GROQ_MODEL` | No | Groq / — / `openai/gpt-oss-120b` | Any OpenAI-compatible provider (e.g. Ollama `http://localhost:11434/v1`, vLLM). |
-| `LLM_<ROLE>_MODEL` (+ `_BASE_URL`, `_API_KEY`) | No | default model | Per-agent models. ROLE = VERIFIER, ANSWER, CORRECTOR, EXTRACTOR, ABSTENTION, DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT, COMPOSER, BASELINE, JUDGE. |
+| `LLM_<ROLE>_MODEL` (+ `_BASE_URL`, `_API_KEY`) | No | default model | Per-agent models. ROLE = VERIFIER, ANSWER, CORRECTOR, EXTRACTOR, ABSTENTION, DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT, COMPOSER, VERIFIER2 (the Confirmer; use a different family than VERIFIER), BASELINE, JUDGE. |
 | `LLM_JSON_MODE` | No | `0` | `1` = request JSON objects from the server (recommended for small open models). |
 | `HALLUCIGUARD_CONTROLLER` | No | `blackboard` | Default controller for `process_response`: `blackboard`, `pipeline`, `cove`, `crag`. |
 | `BLACKBOARD_MAX_LLM_CALLS` | No | `8` | Per-question LLM-call budget of the blackboard (the eval's `--max_llm_calls` overrides it). |

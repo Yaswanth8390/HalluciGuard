@@ -18,17 +18,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from knowledge_sources import (Activation, Composer, ConflictResolver, Decomposer, HypothesisGenerator,
-                               KnowledgeSource, MemoryKS, QueryReformulator, RetrievalKS, VerifierKS,
-                               WebSearchKS)
+from knowledge_sources import (Activation, Composer, Confirmer, ConflictResolver, Decomposer,
+                               HypothesisGenerator, KnowledgeSource, MemoryKS, QueryReformulator, RetrievalKS,
+                               VerifierKS, WebSearchKS)
 from workspace import (ACCEPTED, CONTRADICTED, DECISIVE, INSUFFICIENT, OPEN, PENDING, REJECTED, REVISED,
                        SUPPORTED, Workspace)
 
 SOURCE_RELIABILITY = {"kb": 1.0, "memory": 0.9, "web": 0.8, "resolver": 1.0}
-ALL_KS = ("Decomposer", "Memory", "Retrieval", "QueryReformulator", "WebSearch", "Verifier",
+ALL_KS = ("Decomposer", "Memory", "Retrieval", "QueryReformulator", "WebSearch", "Verifier", "Confirmer",
           "HypothesisGenerator", "ConflictResolver")
 # knowledge sources an ablation may switch off (the rest are structural)
-ABLATABLE = ("Memory", "QueryReformulator", "WebSearch", "HypothesisGenerator", "ConflictResolver")
+ABLATABLE = ("Memory", "QueryReformulator", "WebSearch", "Confirmer", "HypothesisGenerator", "ConflictResolver")
 
 
 def _now():
@@ -42,7 +42,8 @@ class BudgetExhausted(Exception):
 class BlackboardController:
     def __init__(self, knowledge_sources: Iterable[KnowledgeSource], composer: Composer, *,
                  max_llm_calls: int = 8, accept_threshold: float = 0.5, min_conf: float = 0.5,
-                 short_max_words: int = 15, max_cycles: int = 60, disabled: Iterable[str] = ()):
+                 short_max_words: int = 15, max_cycles: int = 60, disabled: Iterable[str] = (),
+                 confirm_risk: float = 0.5, grounding: bool = True):
         self.disabled = set(disabled)
         unknown = self.disabled - set(ALL_KS)
         if unknown:
@@ -56,6 +57,12 @@ class BlackboardController:
         self.min_conf = min_conf
         self.short_max_words = short_max_words
         self.max_cycles = max_cycles
+        # probe-scaled acceptance: a base-model answer whose risk score is >= confirm_risk needs a second,
+        # independent model to agree before it is accepted (evidence-derived answers always do)
+        self.confirm_risk = float(confirm_risk)
+        # entity / answer grounding for answer generation and confirmation (knowledge_sources.topical,
+        # grounded_in); off only for the ablation
+        self.grounding = bool(grounding)
 
     def get_ks(self, name: str) -> Optional[KnowledgeSource]:
         return next((k for k in self.ks if k.name == name), None)
@@ -63,7 +70,17 @@ class BlackboardController:
     def config(self) -> Dict[str, Any]:
         return {"max_llm_calls": self.max_llm_calls, "accept_threshold": self.accept_threshold,
                 "min_conf": self.min_conf, "short_max_words": self.short_max_words,
+                "confirm_risk": self.confirm_risk, "grounding": self.grounding,
                 "knowledge_sources": [k.name for k in self.ks], "disabled": sorted(self.disabled)}
+
+    def needs_confirmation(self, ws: Workspace, c: Dict[str, Any]) -> bool:
+        """Must a SUPPORTED claim also pass the Confirmer before it counts?"""
+        if self.get_ks("Confirmer") is None:
+            return False
+        if ws.question["form"] == "short":
+            h = ws.get(c["hyp_id"])
+            return h["origin"] != "base_model" or float(c.get("risk", 1.0)) >= self.confirm_risk
+        return bool(c.get("revises"))     # long form: a revised claim was written from the evidence
 
     # ------------------------------------------------------------------ status
     def _claim_score(self, ws, c) -> float:
@@ -82,19 +99,30 @@ class BlackboardController:
             resolver = [v for v in vs if v["author"] == "ConflictResolver"]
             decisive = {v["label"] for v in vs if v["label"] in DECISIVE and v["confidence"] >= self.min_conf}
             score = self._claim_score(ws, c)
+            confirmation = None
             if resolver:
                 status = resolver[-1]["label"]
+                if status == SUPPORTED and self.needs_confirmation(ws, c):
+                    confirmation = "confirmed"      # an arbitrated conflict counts as the second check
             elif decisive:
                 status = SUPPORTED if score > 0 else CONTRADICTED if score < 0 else INSUFFICIENT
                 if len(decisive) == 2 and not c["conflict_raised"]:
                     if self.get_ks("ConflictResolver"):
                         ws.add("conflict", "Control", about="claim", claim_id=c["id"], status=OPEN)
                     ws.update(c["id"], "Control", conflict_raised=True)
+                if status == SUPPORTED and self.needs_confirmation(ws, c):
+                    second = [v for v in vs if v["author"] == "Confirmer"]
+                    if not second:
+                        confirmation = "pending"
+                    elif second[-1]["label"] == SUPPORTED and second[-1]["confidence"] >= self.min_conf:
+                        confirmation = "confirmed"
+                    else:   # the second model did not agree: not good enough to accept
+                        confirmation, status = "failed", INSUFFICIENT
             elif vs:
                 status = INSUFFICIENT
             else:
                 status = OPEN
-            ws.update(c["id"], "Control", status=status, score=round(score, 4))
+            ws.update(c["id"], "Control", status=status, score=round(score, 4), confirmation=confirmation)
 
         short = ws.question["form"] == "short"
         for h in ws.hypotheses():
@@ -106,7 +134,8 @@ class BlackboardController:
             if short:
                 if any(c["status"] == CONTRADICTED for c in cs):
                     status = REJECTED
-                elif cs and all(c["status"] == SUPPORTED for c in cs) and support >= self.accept_threshold:
+                elif (cs and all(c["status"] == SUPPORTED and c.get("confirmation") in (None, "confirmed")
+                                 for c in cs) and support >= self.accept_threshold):
                     status = ACCEPTED
                 else:
                     status = OPEN
@@ -229,7 +258,7 @@ class BlackboardController:
             "flagged_span": riskiest["span"] if riskiest else None,
             "verification_result": {"verdict": overall, "claims": [
                 {"id": c["id"], "text": c["text"], "status": c["status"], "score": c.get("score", 0.0),
-                 "revises": c.get("revises")} for c in claims]},
+                 "revises": c.get("revises"), "confirmation": c.get("confirmation")} for c in claims]},
             "correction_result": {"mode": mode, **{k: v for k, v in comp.items() if k not in ("final_response",)}},
             "evidence_source": evidence_source,
             "budget": {"llm_calls": calls, "max_llm_calls": self.max_llm_calls, "cycles": cycles,
@@ -252,7 +281,7 @@ class BlackboardController:
         from workspace import ScratchBoard
         for c in ws.of_kind("claim"):
             vs = [v for v in ws.verdicts_of(c["id"]) if v["author"] != "Memory" and v["label"] in DECISIVE]
-            if not vs or c["status"] not in DECISIVE:
+            if not vs or c["status"] not in DECISIVE or c.get("confirmation") == "pending":
                 continue
             v = vs[-1]
             if not v["evidence_ids"] and v["author"] == "Verifier":
@@ -276,7 +305,8 @@ def build_controller(*, retrieval_agent, verifier_agent, answer_agent, correctio
                      max_llm_calls: Optional[int] = None, disabled: Iterable[str] = (),
                      retrieval_top_k: int = 5, max_claims: int = 8, **kw) -> BlackboardController:
     """Wire the knowledge sources from existing agents + per-role LLM callers
-    (callers: DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT, COMPOSER -> caller)."""
+    (callers: DECOMPOSER, REFORMULATOR, HYPOTHESIS, CONFLICT, COMPOSER, VERIFIER2 -> caller).
+    VERIFIER2 is the Confirmer's model; give it a different model family than the Verifier."""
     callers = callers or {}
     if max_llm_calls is None:
         max_llm_calls = int(os.getenv("BLACKBOARD_MAX_LLM_CALLS", "8"))
@@ -285,6 +315,7 @@ def build_controller(*, retrieval_agent, verifier_agent, answer_agent, correctio
         RetrievalKS(retrieval_agent, top_k=retrieval_top_k),
         QueryReformulator(callers.get("REFORMULATOR")) if callers.get("REFORMULATOR") else None,
         VerifierKS(verifier_agent),
+        Confirmer(callers.get("VERIFIER2")) if callers.get("VERIFIER2") else None,
         HypothesisGenerator(answer_agent, llm_caller=callers.get("HYPOTHESIS")),
         ConflictResolver(callers.get("CONFLICT")) if callers.get("CONFLICT") else None,
     ]

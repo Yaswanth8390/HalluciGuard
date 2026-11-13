@@ -880,10 +880,12 @@ def kb_breakdown(records, base_labels, bb_labels) -> Optional[Dict[str, Any]]:
 
 STAGE2_KEYS = ("threshold", "default_score", "no_knowledge", "enable_web", "isolate_memory", "fallback_on_error",
                "llm_model", "llm_base_url", "llm_roles", "no_llm_abstention",
-               "kb_coverage", "kb_seed", "kb_file", "kb_file_sha256", "system", "max_llm_calls", "disable_ks")
+               "kb_coverage", "kb_seed", "kb_file", "kb_file_sha256", "system", "max_llm_calls", "disable_ks",
+               "confirm_risk", "grounding")
 # old checkpoints predate --system: they were made by the fixed pipeline
 _STAGE2_KEY_DEFAULTS = {"kb_coverage": None, "kb_seed": None, "kb_file": None, "kb_file_sha256": None,
-                        "system": "pipeline", "max_llm_calls": None, "disable_ks": None}
+                        "system": "pipeline", "max_llm_calls": None, "disable_ks": None,
+                        "confirm_risk": None, "grounding": None}
 
 
 def _stage2_meta(args) -> Dict[str, Any]:
@@ -1016,7 +1018,8 @@ def run_blackboard_stage(records, args, partial_path=None):
         bc.blackboard_controller = bc.build_blackboard_controller(
             memory_agent=None if args.isolate_memory else bc.memory_agent,
             web_search_agent=bc.web_search_agent if args.enable_web else None,
-            max_llm_calls=getattr(args, "max_llm_calls", None), disabled=disabled)
+            max_llm_calls=getattr(args, "max_llm_calls", None), disabled=disabled,
+            confirm_risk=getattr(args, "confirm_risk", None), grounding=getattr(args, "grounding", None))
         bc.BLACKBOARD_WRITE_MEMORY = not args.isolate_memory
         print(f"[stage 2] system: {system}; blackboard config: {bc.blackboard_controller.config()}")
 
@@ -1260,6 +1263,8 @@ def build_report(records, rows, base_labels, bb_labels, args, extra: Optional[Di
             "system": getattr(args, "system", "pipeline"),
             "max_llm_calls": getattr(args, "max_llm_calls", None),
             "disable_ks": getattr(args, "disable_ks", None),
+            "confirm_risk": getattr(args, "confirm_risk", None),
+            "grounding": getattr(args, "grounding", None),
         },
         "llm_calls": _call_stats(rows),
         "without_blackboard": base,
@@ -1353,6 +1358,10 @@ def format_summary(rep: Dict[str, Any]) -> str:
                      + ", ".join(f"{k}={v}" for k, v in sorted(lc["stop_reasons"].items())) + ".")
     if rep["config"].get("disable_ks"):
         lines.append(f"Ablation: knowledge sources disabled = {rep['config']['disable_ks']}.")
+    if rep["config"].get("system") == "blackboard" and rep["config"].get("confirm_risk") is not None:
+        lines.append(f"Cross-model confirmation for base answers with risk >= {rep['config']['confirm_risk']} "
+                     f"(evidence-derived answers always); entity/answer grounding "
+                     f"{'on' if rep['config'].get('grounding') else 'off'}.")
     rc = rep["routing_check"]
     lines.append(f"Routing check: {rc['abstention_path_items']} items went down the abstention path, "
                  f"{rc['abstention_path_but_not_abstention_by_grader']} of them were NOT abstentions by the grader; "
@@ -1475,7 +1484,14 @@ def main():
                      help="LLM-call budget per question for blackboard / cove / crag (ignored by pipeline)")
     bbg.add_argument("--disable_ks", default="",
                      help="ablation: comma-separated knowledge sources to switch off, from "
-                          "Memory,QueryReformulator,WebSearch,HypothesisGenerator,ConflictResolver")
+                          "Memory,QueryReformulator,WebSearch,Confirmer,HypothesisGenerator,ConflictResolver")
+    bbg.add_argument("--confirm_risk", type=float, default=0.5,
+                     help="blackboard: a base-model answer whose probe risk score is >= this needs the Confirmer "
+                          "(a second model family) to agree before it is accepted; evidence-derived answers "
+                          "always do. 0 = confirm every answer, >1 = only evidence-derived ones")
+    bbg.add_argument("--no_grounding", action="store_true",
+                     help="ablation: switch off entity grounding (only passages about the question's entity may "
+                          "propose or confirm an answer) and the answer-in-evidence check")
     bbg.add_argument("--workers", type=int, default=8,
                      help="parallel questions in stage 2 (lower it if Groq returns 429s)")
 
@@ -1540,7 +1556,7 @@ def main():
     args.kb_seed = (args.seed if args.kb_seed is None else args.kb_seed) if args.kb_coverage is not None else None
     args.kb_file_sha256 = _sha256(args.kb_file)
     ks = sorted({x.strip() for x in args.disable_ks.split(",") if x.strip()})
-    allowed = {"Memory", "QueryReformulator", "WebSearch", "HypothesisGenerator", "ConflictResolver"}
+    allowed = {"Memory", "QueryReformulator", "WebSearch", "Confirmer", "HypothesisGenerator", "ConflictResolver"}
     if set(ks) - allowed:
         ap.error(f"--disable_ks: unknown {sorted(set(ks) - allowed)}; choose from {sorted(allowed)}")
     if ks and args.system != "blackboard":
@@ -1548,6 +1564,12 @@ def main():
     args.disable_ks = ",".join(ks) or None
     if args.system == "pipeline":
         args.max_llm_calls = None   # the fixed pipeline has no budget; keep its checkpoints comparable
+    # blackboard-only settings; recorded only for the blackboard so baseline checkpoints stay comparable
+    args.grounding = None if args.system != "blackboard" else not args.no_grounding
+    if args.system != "blackboard":
+        args.confirm_risk = None
+    if args.no_grounding and args.system != "blackboard":
+        ap.error("--no_grounding only applies to --system blackboard")
     ex = probe_exclusions(args)
 
     if args.answers_file:
