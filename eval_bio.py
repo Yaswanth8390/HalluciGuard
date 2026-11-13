@@ -164,8 +164,13 @@ def main():
     def scored(path, items, field):
         if path.exists() and len(read_jsonl(path)) == len(items):
             return read_jsonl(path)
-        s = fe.score_many(items, field, kb, caller, args.judge_batch, args.workers)
+        partial = path.with_name(path.stem + ".partial.jsonl")
+        s = fe.score_many(items, field, kb, caller, args.judge_batch, args.workers, partial_path=partial)
         write_jsonl(path, s)
+        partial.unlink(missing_ok=True)
+        n_err = sum(1 for x in s if x.get("error"))
+        if n_err:
+            print(f"  {n_err} of {len(s)} responses could not be judged (left out of FActScore; see 'error' in {path})")
         return s
 
     print("[score] raw answers...")
@@ -212,6 +217,10 @@ def main():
     if probe_rep and probe_rep["auroc_low_factscore"] is not None:
         lines += ["", f"Probe on long-form answers: AUROC {probe_rep['auroc_low_factscore']:.3f} for flagging "
                       f"below-median raw FActScore (n={probe_rep['n']}); the probe was trained on short answers."]
+    errs = {t: m.get("errors", 0) for t, m in table.items() if m.get("errors")}
+    if errs:
+        lines += ["", "Responses the judge could not score (left out of FActScore): "
+                      + ", ".join(f"{t}={n}" for t, n in errs.items()) + "."]
     lines += ["", f"Judge: {judge_cfg}. Knowledge source: {metrics['knowledge_source']}.",
               "FActScore is computed over responses that did not abstain; read it together with % responding."]
     (out / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
