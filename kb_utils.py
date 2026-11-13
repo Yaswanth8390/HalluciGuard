@@ -11,7 +11,8 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-USER_AGENT = "HalluciGuard-research/0.2 (academic hallucination-mitigation evaluation)"
+USER_AGENT = "HalluciGuard-research/0.3 (https://github.com/Yaswanth8390/HalluciGuard)"
+WIKI_API = "https://en.wikipedia.org/w/api.php"
 _SECTION_JUNK = re.compile(r"^(See also|References|External links|Further reading|Notes|Bibliography|Sources)\b", re.I)
 
 
@@ -63,9 +64,63 @@ def gold_passage(passages: List[str], answers: Iterable[str]) -> Optional[str]:
     return None
 
 
-def fetch_wikipedia(titles: Iterable[str], cache_path: Optional[str] = None, sleep: float = 0.2,
-                    verbose: bool = True) -> Dict[str, str]:
-    """Plain-text article for each title (empty string if missing). Results are cached as jsonl."""
+class _RateLimited(Exception):
+    def __init__(self, wait: float):
+        super().__init__(f"rate limited, retry in {wait:.0f}s")
+        self.wait = wait
+
+
+def _retry_after(r, attempt: int) -> float:
+    try:
+        return max(1.0, min(120.0, float(r.headers.get("Retry-After", ""))))
+    except (TypeError, ValueError):
+        return float(min(60, 5 * 2 ** attempt))
+
+
+def _fetch_one(sess, title: str, attempts: int, log) -> Optional[Dict[str, object]]:
+    """{"text", "missing"} for one title, or None if every attempt failed (never cached)."""
+    for attempt in range(attempts):
+        try:
+            r = sess.get(WIKI_API, timeout=30, params={
+                "action": "query", "format": "json", "prop": "extracts", "explaintext": 1,
+                "redirects": 1, "maxlag": 5, "titles": title})
+            if r.status_code in (429, 503):
+                raise _RateLimited(_retry_after(r, attempt))
+            r.raise_for_status()
+            data = r.json()
+            if (data.get("error") or {}).get("code") == "maxlag":   # Wikipedia's servers are lagging: back off
+                raise _RateLimited(_retry_after(r, attempt))
+            page = next(iter((data.get("query") or {}).get("pages", {}).values()), {})
+            if "missing" in page or "invalid" in page:
+                return {"text": "", "missing": True}
+            return {"text": page.get("extract", "") or "", "missing": False}
+        except _RateLimited as exc:
+            if attempt == attempts - 1:
+                log(f"  wikipedia fetch failed for {title!r}: {exc}")
+                return None
+            _PACE["sleep"] = min(5.0, _PACE["sleep"] * 2)          # slow down for the rest of the run
+            time.sleep(exc.wait)
+        except Exception as exc:                                    # network hiccup, bad JSON, 5xx
+            if attempt == attempts - 1:
+                log(f"  wikipedia fetch failed for {title!r}: {exc}")
+                return None
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+_PACE = {"sleep": 0.5}
+
+
+def fetch_wikipedia(titles: Iterable[str], cache_path: Optional[str] = None, sleep: float = 0.5,
+                    verbose: bool = True, attempts: int = 8, second_pass_wait: float = 60.0,
+                    failed: Optional[List[str]] = None) -> Dict[str, str]:
+    """Plain-text article for each title ("" if Wikipedia has no such page). Results are cached as jsonl.
+
+    Only real answers are cached: a request that failed (rate limit, network) is NOT written, so a rerun
+    retries it. Old cache rows with empty text and no `missing` flag (failures cached by earlier versions)
+    are retried too. Titles that still fail after a second pass are left out of the result and appended to
+    `failed` if given. Pacing adapts: the pause between requests doubles after a 429 (max 5 s) and
+    relaxes again after successful requests."""
     import requests
 
     cache: Dict[str, str] = {}
@@ -74,35 +129,43 @@ def fetch_wikipedia(titles: Iterable[str], cache_path: Optional[str] = None, sle
         for line in cp.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 row = json.loads(line)
-                cache[row["title"]] = row["text"]
+                if row.get("text") or row.get("missing"):
+                    cache[row["title"]] = row.get("text") or ""
     todo = [t for t in dict.fromkeys(titles) if t and t not in cache]
     sess = requests.Session()
     sess.headers["User-Agent"] = USER_AGENT
+    log = print if verbose else (lambda *a, **k: None)
+    _PACE["sleep"] = sleep
     fh = open(cp, "a", encoding="utf-8") if cp else None
+    still_failed: List[str] = []
     try:
-        for i, title in enumerate(todo):
-            text = ""
-            for attempt in range(3):
-                try:
-                    r = sess.get("https://en.wikipedia.org/w/api.php", timeout=30, params={
-                        "action": "query", "format": "json", "prop": "extracts", "explaintext": 1,
-                        "redirects": 1, "titles": title})
-                    r.raise_for_status()
-                    pages = r.json().get("query", {}).get("pages", {})
-                    text = next(iter(pages.values()), {}).get("extract", "") or ""
+        for round_ in range(2):
+            if round_ == 1:
+                if not still_failed:
                     break
-                except Exception as exc:
-                    if attempt == 2:
-                        print(f"  wikipedia fetch failed for {title!r}: {exc}")
-                    time.sleep(2 * (attempt + 1))
-            cache[title] = text
-            if fh:
-                fh.write(json.dumps({"title": title, "text": text}, ensure_ascii=False) + "\n")
-                fh.flush()
-            if verbose and (i + 1) % 50 == 0:
-                print(f"  fetched {i + 1}/{len(todo)} articles")
-            time.sleep(sleep)
+                log(f"  {len(still_failed)} articles failed; waiting {second_pass_wait:.0f}s, then retrying them")
+                time.sleep(second_pass_wait)
+                todo, still_failed = still_failed, []
+            for i, title in enumerate(todo):
+                got = _fetch_one(sess, title, attempts, log)
+                if got is None:
+                    still_failed.append(title)
+                else:
+                    cache[title] = got["text"]
+                    if fh:
+                        fh.write(json.dumps({"title": title, "text": got["text"], "missing": got["missing"]},
+                                            ensure_ascii=False) + "\n")
+                        fh.flush()
+                    _PACE["sleep"] = max(sleep, _PACE["sleep"] * 0.9)
+                if verbose and (i + 1) % 50 == 0:
+                    log(f"  fetched {i + 1}/{len(todo)} articles")
+                time.sleep(_PACE["sleep"])
     finally:
         if fh:
             fh.close()
+    if still_failed:
+        log(f"  {len(still_failed)} articles could not be fetched (rate limit); rerun the same command to "
+            f"retry only those (everything fetched so far is cached)")
+    if failed is not None:
+        failed.extend(still_failed)
     return cache

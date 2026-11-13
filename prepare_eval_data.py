@@ -136,7 +136,8 @@ def add_wikipedia(items, args):
     Path(args.wiki_cache).parent.mkdir(parents=True, exist_ok=True)
     titles = [x["s_wiki_title"] for x in items if x.get("s_wiki_title")]
     print(f"fetching {len(set(titles))} Wikipedia articles (cached in {args.wiki_cache})...")
-    texts = fetch_wikipedia(titles, cache_path=args.wiki_cache)
+    failed = []
+    texts = fetch_wikipedia(titles, cache_path=args.wiki_cache, failed=failed)
     kb_path = Path(args.kb_out or str(Path(args.out).with_suffix("")) + "_kb.jsonl")
     seen, n_gold, n_article = set(), 0, 0
     with open(kb_path, "w", encoding="utf-8") as f:
@@ -153,6 +154,9 @@ def add_wikipedia(items, args):
                     f.write(json.dumps({"text": p, "title": title}, ensure_ascii=False) + "\n")
     print(f"wikipedia: {n_article}/{len(items)} items have an article, {n_gold} contain a gold answer; "
           f"{len(seen)} passages -> {kb_path}")
+    if failed:
+        print(f"WARNING: {len(failed)} articles could not be fetched (Wikipedia rate limit), so their questions have "
+              f"no passage in the KB. Rerun this command: only the missing articles are fetched again.")
 
 
 def main():
