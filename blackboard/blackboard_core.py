@@ -1344,6 +1344,13 @@ def _split_urls(value):
 
 
 LLM_BASE_URLS = _split_urls(LLM_BASE_URL)
+# With several servers, the caller below does the retrying and fails over to the other server at once.
+# The SDK's own retries (2 by default, on the SAME server, each waiting the full timeout) would keep a call
+# stuck on a hung server for 3 x LLM_TIMEOUT before failover. LLM_CLIENT_RETRIES overrides.
+if os.getenv("LLM_CLIENT_RETRIES") is not None:
+    _CLIENT_KW["max_retries"] = int(os.getenv("LLM_CLIENT_RETRIES"))
+elif len(LLM_BASE_URLS) > 1:
+    _CLIENT_KW["max_retries"] = 0
 _groq_clients = [OpenAI(base_url=u, api_key=GROQ_API_KEY, **_CLIENT_KW) for u in LLM_BASE_URLS]
 _groq_client = _groq_clients[0]
 
