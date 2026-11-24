@@ -94,7 +94,7 @@ def _read_rows(path: str) -> List[Dict[str, Any]]:
     if text[0] == "[":  # one JSON array
         return json.loads(text)
     rows = []  # JSONL
-    for line in text.splitlines():
+    for line in text.split("\n"):
         line = line.strip()
         if line:
             rows.append(json.loads(line))

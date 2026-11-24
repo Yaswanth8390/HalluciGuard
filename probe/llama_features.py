@@ -60,9 +60,13 @@ class QwenResidualFeatureExtractor:
             total_mem_gb = torch.cuda.get_device_properties(cuda_index).total_memory / (1024**3)
             max_memory = {cuda_index: f"{total_mem_gb:.1f}GiB"}
             device_map = {"": cuda_index}
+        # bf16 by default (what the probe was trained on). QWEN_DTYPE=float16 is faster on GPUs without
+        # native bf16 (T4), but slightly changes the features a bf16-trained probe sees.
+        import os
+        dtype = getattr(torch, os.getenv("QWEN_DTYPE", "bfloat16"))
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device_map=device_map,
             max_memory=max_memory,
         )
@@ -236,11 +240,14 @@ class QwenResidualFeatureExtractor:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": q},
             ]
-            formatted.append(
-                self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            )
+            try:
+                text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                # some templates (e.g. Gemma, older Mistral) reject a system role: fold it into the user turn.
+                # Qwen's template accepts it, so Qwen prompts (and the probe's features) are unchanged.
+                merged = [{"role": "user", "content": f"{system_prompt}\n\n{q}"}]
+                text = self.tokenizer.apply_chat_template(merged, tokenize=False, add_generation_prompt=True)
+            formatted.append(text)
         return formatted
 
     def batch_generate_and_extract_features(

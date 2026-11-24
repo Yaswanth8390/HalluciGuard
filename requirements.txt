@@ -3,7 +3,7 @@ fastapi
 uvicorn
 chromadb
 openai
-google-genai
+google-genai   # optional: legacy Gemini path only
 requests
 
 # Probe / detection side
@@ -14,3 +14,6 @@ joblib
 numpy
 datasets
 accelerate
+
+# Tests
+pytest

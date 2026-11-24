@@ -1,0 +1,6 @@
+# Extra packages for a Kaggle / Colab GPU notebook (torch, transformers, accelerate, datasets,
+# scikit-learn, joblib and numpy are preinstalled there).
+chromadb
+openai
+requests
+pytest

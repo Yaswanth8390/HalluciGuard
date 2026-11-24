@@ -193,8 +193,8 @@ def test_stats_and_guards():
     assert ev.mcnemar_exact(0, 0) == 1.0 and ev.mcnemar_exact(10, 0) < 0.01
     # probe-training rows and duplicate questions are excluded
     import json as _j, tempfile as _t
-    rows = [{"question": f"Q{i}?", "right_answer": "a", "knowledge": "k"} for i in range(10)]
-    rows.append({"question": "Q3?", "right_answer": "a", "knowledge": "k"})   # duplicate
+    rows = [{"question": f"Q{i}?", "right_answer": "Paris", "knowledge": "k"} for i in range(10)]
+    rows.append({"question": "Q3?", "right_answer": "Paris", "knowledge": "k"})   # duplicate
     f = _t.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
     f.write("\n".join(_j.dumps(r) for r in rows)); f.close()
     recs = ev.load_dataset(f.name, "halueval", exclude_ids=set(range(0, 5)))
@@ -382,6 +382,53 @@ print('RESULT', json.dumps({'cfg': b.ROLE_CONFIG, 'seen': seen, 'n_clients': len
     r = run({"LLM_CORRECTOR_MODEL": "llama"})                      # same endpoint, different model: no extra client
     assert r["cfg"]["CORRECTOR"]["model"] == "llama" and r["n_clients"] == 1
     print("ok  per-role models (mixed LLMs), defaults unchanged")
+
+
+def test_multi_server_routing():
+    """LLM_BASE_URL / LLM_<ROLE>_BASE_URL may list several servers (one per GPU): concurrent calls are
+    spread over them, and a failing server is skipped on retry."""
+    import subprocess, tempfile, json as _j
+    code = r"""
+import sys, json, time, threading; sys.path.insert(0, 'blackboard')
+import blackboard_core as b
+b.time.sleep = lambda s: None
+seen = []
+class M: content = 'ok'
+class C: message = M()
+class R: choices = [C()]
+def spy(tag, fail=False):
+    def create(**k):
+        seen.append(tag)
+        if fail: raise RuntimeError('server down')
+        threading.Event().wait(0.05)   # a call that takes a while, so calls overlap
+        return R()
+    return create
+urls = [str(c.base_url).rstrip('/') for c in b._groq_clients]
+for i, c in enumerate(b._groq_clients):
+    c.chat.completions.create = spy(f'gpu{i}')
+ts = [threading.Thread(target=b.verifier_agent.llm_caller, args=('p',)) for _ in range(8)]
+[t.start() for t in ts]; [t.join() for t in ts]
+spread = {t: seen.count(t) for t in set(seen)}
+seen.clear()
+b._groq_clients[0].chat.completions.create = spy('gpu0', fail=True)
+out = [b.verifier_agent.llm_caller('p') for _ in range(3)]
+role_urls = [str(c.base_url).rstrip('/') for c in [b._ROLE_CLIENTS.get('JUDGE')] if c]
+print('RESULT', json.dumps({'urls': urls, 'spread': spread, 'failover': seen, 'out': out,
+      'n_clients': len(b.all_clients())}))
+"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LLM_")}
+    env.update({"CHROMA_PERSIST_DIRECTORY": tempfile.mkdtemp(), "GROQ_MODEL": "llama",
+                "LLM_BASE_URL": "http://localhost:11434/v1,http://localhost:11435/v1"})
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120)
+    line = [l for l in out.stdout.splitlines() if l.startswith("RESULT")]
+    assert line, out.stderr[-800:]
+    r = _j.loads(line[0][7:])
+    assert r["urls"] == ["http://localhost:11434/v1", "http://localhost:11435/v1"] and r["n_clients"] == 2
+    assert r["spread"].get("gpu0", 0) >= 2 and r["spread"].get("gpu1", 0) >= 2, r["spread"]   # both servers used
+    # gpu0 fails once, is then avoided for 30 s: every call still succeeds, at most one wasted attempt
+    assert r["out"] == ["ok"] * 3 and r["failover"].count("gpu0") <= 1, r["failover"]
+    assert r["failover"].count("gpu1") == 3, r["failover"]
+    print("ok  multi-server routing (one server per GPU: least-busy spread + failover)")
 
 
 def test_provider_override():
@@ -653,7 +700,80 @@ def test_kb_coverage():
     print("ok  domain-KB coverage: selection, KB contents, split report, kb_file, sweep table, checkpoint compat")
 
 
+def fake_llm_v2(prompt, **kw):
+    """fake_llm + the blackboard knowledge sources' prompts + the CoVe / CRAG baselines' prompts."""
+    if "You are the QueryReformulator" in prompt:
+        return json.dumps({"queries": [_between(prompt, "QUESTION")]})
+    if "You are the Decomposer" in prompt:
+        r = _between(prompt, "ASSISTANT_RESPONSE")
+        return json.dumps({"claims": [{"claim": r, "span": r}]})
+    if "You are the ClaimReviser" in prompt:
+        return json.dumps({"revised_claim": "", "evidence_ids": []})
+    if "You are the ConflictResolver" in prompt:
+        return json.dumps({"verdict": "SUPPORTED", "winner": "NONE", "confidence": 0.6, "explanation": "t"})
+    if "You are the Confirmer" in prompt:   # agrees when the claimed answer is written in the evidence
+        ans = _between(prompt, "CLAIM").split("is:")[-1].strip().lower()
+        ok = bool(ans) and ans in _between(prompt, "EVIDENCE").lower()
+        return json.dumps({"verdict": "SUPPORTED" if ok else "INSUFFICIENT", "confidence": 0.9, "explanation": "t"})
+    if "You are the Composer" in prompt:
+        return json.dumps({"response": "composed"})
+    if "Chain-of-Verification, step 2" in prompt:
+        return json.dumps({"questions": ["Is the draft right?"]})
+    if prompt.startswith("Answer the question concisely"):
+        return "Unknown"
+    if "finishing a Chain-of-Verification" in prompt:
+        return json.dumps({"final_answer": _between(prompt, "DRAFT_ANSWER")})
+    if "You are a retrieval evaluator" in prompt:
+        ids = re.findall(r"\[id=([^\]]+)\]", prompt)
+        return json.dumps({"labels": {i: "CORRECT" for i in ids}})
+    if "Answer the question using the knowledge below" in prompt:
+        kn = _between(prompt, "KNOWLEDGE")
+        return json.dumps({"final_answer": re.sub(r"\[id=[^\]]+\]\s*", "", kn).split("\n\n")[0]})
+    return fake_llm(prompt, **kw)
+
+
+def test_new_systems_through_eval():
+    """--system blackboard / cove / crag run end to end through eval_pipeline + blackboard_core."""
+    import blackboard_core as bc0
+    saved = dict(bc0.BLACKBOARD_ROLE_CALLERS), bc0.BASELINE_CALLER
+    for k in bc0.BLACKBOARD_ROLE_CALLERS:
+        bc0.BLACKBOARD_ROLE_CALLERS[k] = fake_llm_v2
+    bc0.BASELINE_CALLER = fake_llm_v2
+    try:
+        recs = ev.load_dataset(str(ROOT / "eval_data" / "sample_qa.jsonl"), "halueval")
+        wrong = {"What is the capital of Australia?": "Sydney", "Who discovered penicillin?": "Unknown",
+                 "Who wrote the play Hamlet?": "Marlowe"}
+        for r in recs:
+            r["answer"] = wrong.get(r["question"], r["gold"][0])
+            r["prob_hallucinated"] = 0.9 if r["question"] in wrong else 0.1
+        for system in ("blackboard", "cove", "crag"):
+            args = Namespace(threshold=0.70, default_score=1.0, chroma_dir=os.environ["CHROMA_PERSIST_DIRECTORY"],
+                             no_knowledge=False, oracle_knowledge=True, enable_web=False, isolate_memory=True,
+                             match="lenient", llm_judge=False, seed=0, workers=2, system=system, max_llm_calls=6,
+                             disable_ks=None)
+            rows, _ = ev.run_blackboard_stage(recs, args)
+            routed = [x for x, r in zip(rows, recs) if r["question"] in wrong]
+            assert all(x["status"] not in ("ERROR", "ERROR_FALLBACK") for x in rows), [x["error"] for x in rows]
+            assert all(x["llm_calls"] is not None and x["llm_calls"] <= 6 for x in routed), routed
+            assert sum(1 for x in rows if x["status"] == "SKIPPED_LOW_RISK") == len(recs) - len(wrong)
+            if system == "blackboard":
+                assert all(x.get("bb_cycles") for x in routed)
+                pen = next(x for x, r in zip(rows, recs) if r["question"] == "Who discovered penicillin?")
+                assert pen["status"] in ("ABSTENTION_RESOLVED", "ABSTENTION")
+            base = [ev.grade(r["answer"], r["gold"]) for r in recs]
+            bb = [ev.grade(x["final_response"], r["gold"]) for r, x in zip(recs, rows)]
+            rep = ev.build_report(recs, rows, base, bb, args)
+            assert rep["llm_calls"]["n_items"] == len(wrong) and rep["config"]["system"] == system
+            assert "system = " + system in ev.format_summary(rep)
+    finally:
+        bc0.BLACKBOARD_ROLE_CALLERS.clear()
+        bc0.BLACKBOARD_ROLE_CALLERS.update(saved[0])
+        bc0.BASELINE_CALLER = saved[1]
+    print("ok  --system blackboard / cove / crag end to end (budget, traces, statuses)")
+
+
 if __name__ == "__main__":
+    test_new_systems_through_eval()
     test_grading()
     test_processing_error_accounting()
     test_stats_and_guards()
@@ -666,6 +786,7 @@ if __name__ == "__main__":
     test_abstention_routing_guards()
     test_length_cap()
     test_per_role_models()
+    test_multi_server_routing()
     test_provider_override()
     test_preflight()
     test_partial_checkpoint_and_max_items()
